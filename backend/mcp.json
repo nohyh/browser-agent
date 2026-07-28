@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "agent-browser": {
+      "command": "cmd.exe",
+      "args": [
+        "/d",
+        "/s",
+        "/c",
+        "agent-browser.cmd mcp --tools all"
+      ]
+    }
+  }
+}
