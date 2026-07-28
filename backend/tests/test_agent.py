@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 from pydantic import ValidationError
 
 from app.agent import Agent, AgentAction, AgentDecision
+from app.llm import AgentLLM
 from app.mcp_client import BrowserService
 from app.utils import format_mcp_tools
 
@@ -116,16 +117,19 @@ class FakeBrowser:
         return {"success": True, "action": name}
 
 
-class FakeLLM:
+class FakeResponses:
     def __init__(self, decisions):
         self.decisions = list(decisions)
-        self.messages = []
-        self.tools = []
+        self.calls = []
 
-    async def decide(self, messages, tools):
-        self.messages.append(messages)
-        self.tools.append(tools)
-        return self.decisions.pop(0)
+    async def parse(self, **kwargs):
+        self.calls.append(kwargs)
+        return SimpleNamespace(output_parsed=self.decisions.pop(0))
+
+
+class FakeOpenAIClient:
+    def __init__(self, decisions):
+        self.responses = FakeResponses(decisions)
 
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
@@ -141,7 +145,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_current_observation_is_replaced_and_page_change_ends_batch(self):
         browser = FakeBrowser()
-        llm = FakeLLM(
+        openai_client = FakeOpenAIClient(
             [
                 AgentDecision(
                     actions=[
@@ -162,6 +166,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 AgentDecision(final_answer="finished"),
             ]
         )
+        llm = AgentLLM(openai_client, model="test-model")
         agent = Agent(
             task="fill and submit",
             session_id="browser-session-1",
@@ -169,6 +174,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             llm=llm,
             max_steps=3,
         )
+        agent.trace.append({"type": "debug", "content": "TRACE-ONLY"})
 
         result = await agent.run()
 
@@ -184,14 +190,36 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(result.success)
         self.assertEqual(result.answer, "finished")
-        self.assertIsInstance(llm.tools[0], str)
-        self.assertIn("agent_browser_custom_tool", llm.tools[0])
-        self.assertIn("CURRENT-SNAPSHOT-2", str(llm.messages[1]))
-        self.assertNotIn("CURRENT-SNAPSHOT-1", str(llm.messages[1]))
+        first_call = openai_client.responses.calls[0]
+        second_call = openai_client.responses.calls[1]
+        self.assertEqual(first_call["model"], "test-model")
+        self.assertIs(first_call["text_format"], AgentDecision)
+        self.assertIn("agent_browser_custom_tool", str(first_call["input"]))
+        self.assertIn("CURRENT-SNAPSHOT-2", str(second_call["input"]))
+        self.assertNotIn("CURRENT-SNAPSHOT-1", str(second_call["input"]))
+        self.assertIn("@e1", str(second_call["input"]))
+        self.assertNotIn("TRACE-ONLY", str(second_call["input"]))
+        self.assertEqual(agent.task_context, [])
+        self.assertEqual(
+            [
+                event["name"]
+                for event in agent.trace
+                if event["type"] == "tool_call"
+            ],
+            [
+                "agent_browser_snapshot",
+                "agent_browser_fill",
+                "agent_browser_click",
+                "agent_browser_snapshot",
+            ],
+        )
+        self.assertTrue(
+            any(event["type"] == "llm_result" for event in agent.trace)
+        )
 
-    async def test_final_answer_enters_messages_and_task_history_is_cleared(self):
+    async def test_messages_continue_across_tasks_and_task_context_is_cleared(self):
         browser = FakeBrowser()
-        llm = FakeLLM(
+        openai_client = FakeOpenAIClient(
             [
                 AgentDecision(
                     final_answer="first task finished\n\nTask supplement: exported report.csv"
@@ -199,13 +227,16 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 AgentDecision(final_answer="follow-up finished"),
             ]
         )
+        llm = AgentLLM(openai_client, model="test-model")
         agent = Agent(
             task="export the report",
             session_id="browser-session-1",
             browser=browser,
             llm=llm,
         )
-        agent.history.append("temporary tool result")
+        agent.task_context.append(
+            {"type": "tool_result", "content": "temporary tool result"}
+        )
 
         first_result = await agent.run()
 
@@ -220,17 +251,25 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 },
             ],
         )
-        self.assertEqual(agent.history, [])
+        self.assertEqual(agent.task_context, [])
 
-        agent.messages.append({"role": "user", "content": "check the exported file"})
+        agent.add_user_message("check the exported file")
         await agent.run()
 
-        follow_up_context = str(llm.messages[1])
+        follow_up_context = str(openai_client.responses.calls[1]["input"])
         self.assertIn("first task finished", follow_up_context)
         self.assertIn("check the exported file", follow_up_context)
         self.assertNotIn("temporary tool result", follow_up_context)
         self.assertIn("CURRENT-SNAPSHOT-2", follow_up_context)
         self.assertNotIn("CURRENT-SNAPSHOT-1", follow_up_context)
+        self.assertTrue(
+            any(
+                event["type"] == "message"
+                and event["role"] == "user"
+                and event["content"] == "check the exported file"
+                for event in agent.trace
+            )
+        )
 
 
 if __name__ == "__main__":

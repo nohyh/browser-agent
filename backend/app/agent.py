@@ -1,12 +1,10 @@
 """浏览器 Agent 的最小执行循环与结构化输出模型。"""
 
-import json
 from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
 from app.mcp_client import BrowserService
-from app.utils import format_mcp_tools
 
 
 PAGE_CHANGING_ACTIONS = {
@@ -63,95 +61,108 @@ class Agent:
         llm: Any,
         max_steps: int = 20,
     ):
-        self.messages: list[dict[str, str]] = [
-            {"role": "user", "content": task}
+        initial_message = {"role": "user", "content": task}
+        # messages 保存持续对话；task_context 只服务当前任务；trace 仅用于完整复盘。
+        self.messages: list[dict[str, str]] = [initial_message]
+        self.task_context: list[dict[str, Any]] = []
+        self.trace: list[dict[str, Any]] = [
+            {"type": "message", **initial_message}
         ]
         self.session_id = session_id
         self.browser = browser
         self.llm = llm
         self.max_steps = max_steps
-        # 这里只保存短动作摘要，不保存旧的 DOM 快照，避免上下文持续膨胀。
-        self.history: list[str] = []
 
     async def observe(self) -> Any:
         """获取当前页面的交互元素快照，作为本轮唯一页面状态。"""
-        return await self.browser.call_tool(
-            session_id=self.session_id,
+        return await self._call_tool(
             name="agent_browser_snapshot",
             arguments={"interactive": True, "compact": True},
         )
 
-    def build_messages(self, observation: Any) -> list[dict[str, str]]:
-        """将对话和当前任务状态组合成本轮上下文，不保存旧页面快照。"""
-        recent_history = "\n".join(self.history[-5:]) or "(none)"
-        current_state = self._stringify(observation, limit=20_000)
-        return [
-            {
-                "role": "system",
-                "content": (
-                    "You are a browser agent. Use the available tools to complete the task. "
-                    "Return either one or more actions, or a final answer, but never both. "
-                    "When finished, answer the user first, then add a concise Task supplement "
-                    "only when later conversation may need the result, artifact, important "
-                    "decision, or unresolved issue."
-                ),
-            },
-            *self.messages,
-            {
-                "role": "user",
-                "content": (
-                    f"Recent action history:\n{recent_history}\n\n"
-                    f"Current browser state:\n{current_state}"
-                ),
-            },
-        ]
+    def add_user_message(self, content: str) -> None:
+        """追加用户消息，并同步写入不参与模型上下文的完整记录。"""
+        message = {"role": "user", "content": content}
+        self.messages.append(message)
+        self.trace.append({"type": "message", **message})
 
     async def run(self) -> AgentResult:
         """循环执行“观察、决策、动作”，直到完成或达到最大步数。"""
-        # 工具 schema 保留在本地；这里只向 LLM 提供紧凑的参数签名和描述。
-        tools = format_mcp_tools(self.browser.tools)
         allowed_names = {tool.name for tool in self.browser.tools}
 
         for _ in range(self.max_steps):
             try:
-                # 每轮重新观察，旧页面快照不会进入下一轮历史。
+                # 每轮重新观察，旧页面快照只进入 trace，不进入下一轮任务上下文。
                 observation = await self.observe()
-                raw_decision = await self.llm.decide(
-                    self.build_messages(observation),
-                    tools,
+                self.trace.append(
+                    {
+                        "type": "llm_call",
+                        "observation": observation,
+                        "messages": list(self.messages),
+                        "task_context": list(self.task_context),
+                        "tools": [tool.name for tool in self.browser.tools],
+                    }
                 )
-                decision = (
-                    raw_decision
-                    if isinstance(raw_decision, AgentDecision)
-                    else AgentDecision.model_validate(raw_decision)
+                decision = await self.llm.decide(
+                    observation=observation,
+                    messages=self.messages,
+                    task_context=self.task_context,
+                    tools=self.browser.tools,
+                )
+                self.trace.append(
+                    {"type": "llm_result", "output": decision.model_dump()}
+                )
+                self.task_context.append(
+                    {"type": "llm_result", "output": decision.model_dump()}
                 )
             except Exception as exc:
+                self.trace.append(
+                    {"type": "error", "stage": "loop", "error": str(exc)}
+                )
                 return self._finish(
                     success=False,
                     answer=f"Agent decision failed: {exc}",
                 )
 
-            # 最终答案和工具动作由 AgentDecision 保证互斥。
+            # 如果llm返回了最终结果，直接结束
             if decision.final_answer:
                 return self._finish(success=True, answer=decision.final_answer)
 
             # 限制单轮动作数量，避免模型一次生成过长且难以验证的操作链。
             for action in decision.actions[:3]:
                 if action.name not in allowed_names:
-                    self.history.append(f"{action.name}: tool is not allowed")
+                    rejected_result = {
+                        "type": "tool_result",
+                        "name": action.name,
+                        "arguments": action.arguments,
+                        "error": "tool is not allowed",
+                    }
+                    self.task_context.append(rejected_result)
+                    self.trace.append(rejected_result.copy())
                     break
 
                 try:
-                    result = await self.browser.call_tool(
-                        session_id=self.session_id,
+                    result = await self._call_tool(
                         name=action.name,
                         arguments=action.arguments,
                     )
-                    self.history.append(
-                        f"{action.name}: {self._stringify(result, limit=1_000)}"
+                    self.task_context.append(
+                        {
+                            "type": "tool_result",
+                            "name": action.name,
+                            "arguments": action.arguments,
+                            "result": result,
+                        }
                     )
                 except Exception as exc:
-                    self.history.append(f"{action.name}: error: {exc}")
+                    self.task_context.append(
+                        {
+                            "type": "tool_result",
+                            "name": action.name,
+                            "arguments": action.arguments,
+                            "error": str(exc),
+                        }
+                    )
                     break
 
                 # 页面可能变化后立即结束本轮，下一轮重新获取有效元素引用。
@@ -163,22 +174,36 @@ class Agent:
             answer="Agent reached the maximum number of steps without finishing",
         )
 
-    def _finish(self, success: bool, answer: str) -> AgentResult:
-        """将任务结果写回对话，并清理只在本次任务内有效的动作历史。"""
-        self.messages.append({"role": "assistant", "content": answer})
-        self.history.clear()
-        return AgentResult(success=success, answer=answer)
+    async def _call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        """调用浏览器工具，并将完整调用过程写入 trace。"""
+        self.trace.append(
+            {"type": "tool_call", "name": name, "arguments": arguments}
+        )
+        try:
+            result = await self.browser.call_tool(
+                session_id=self.session_id,
+                name=name,
+                arguments=arguments,
+            )
+        except Exception as exc:
+            self.trace.append(
+                {
+                    "type": "tool_result",
+                    "name": name,
+                    "arguments": arguments,
+                    "error": str(exc),
+                }
+            )
+            raise
+        self.trace.append(
+            {"type": "tool_result", "name": name, "result": result}
+        )
+        return result
 
-    @staticmethod
-    def _stringify(value: Any, limit: int) -> str:
-        """将工具结果转为有长度上限的文本，防止大结果撑爆上下文。"""
-        if isinstance(value, str):
-            text = value
-        else:
-            try:
-                text = json.dumps(value, ensure_ascii=False, default=str)
-            except TypeError:
-                text = str(value)
-        if len(text) <= limit:
-            return text
-        return text[:limit] + "... [truncated]"
+    def _finish(self, success: bool, answer: str) -> AgentResult:
+        """将任务结果写回对话和 trace，并清理当前任务上下文。"""
+        message = {"role": "assistant", "content": answer}
+        self.messages.append(message)
+        self.trace.append({"type": "message", **message})
+        self.task_context.clear()
+        return AgentResult(success=success, answer=answer)
