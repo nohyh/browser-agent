@@ -3,6 +3,8 @@ import {
   CaretRight,
   Check,
   ClockCounterClockwise,
+  Eye,
+  EyeSlash,
   GearSix,
   Paperclip,
   Plus,
@@ -26,6 +28,38 @@ interface Session {
   preview: string;
   updatedAt: string;
   messages: Message[];
+}
+
+interface ModelConfig {
+  apiUrl: string;
+  apiKey: string;
+  model: string;
+}
+
+type StorageStatus = 'loading' | 'idle' | 'saving' | 'saved' | 'error';
+
+const MODEL_CONFIG_STORAGE_KEY = 'modelConfig';
+const DEFAULT_MODEL_CONFIG: ModelConfig = {
+  apiUrl: 'https://api.openai.com/v1',
+  apiKey: '',
+  model: 'gpt-5',
+};
+
+function isModelConfig(value: unknown): value is ModelConfig {
+  if (!value || typeof value !== 'object') return false;
+
+  const candidate = value as Partial<ModelConfig>;
+  return (
+    typeof candidate.apiUrl === 'string' &&
+    typeof candidate.apiKey === 'string' &&
+    typeof candidate.model === 'string'
+  );
+}
+
+function getLocalStorageArea() {
+  // 普通网页预览没有扩展 API，实际扩展环境会使用 chrome.storage.local。
+  if (typeof chrome === 'undefined' || !chrome.storage?.local) return null;
+  return chrome.storage.local;
 }
 
 const sessions: Session[] = [
@@ -366,69 +400,125 @@ function Field({
 
 function SettingsView() {
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
-  const [tested, setTested] = useState(false);
-  const [saved, setSaved] = useState(false);
+  const [config, setConfig] = useState<ModelConfig>(DEFAULT_MODEL_CONFIG);
+  const [storageStatus, setStorageStatus] = useState<StorageStatus>('loading');
+
+  useEffect(() => {
+    let mounted = true;
+
+    const restoreConfig = async () => {
+      const storage = getLocalStorageArea();
+      if (!storage) {
+        if (mounted) setStorageStatus('idle');
+        return;
+      }
+
+      try {
+        const stored = await storage.get(MODEL_CONFIG_STORAGE_KEY);
+        if (mounted && isModelConfig(stored[MODEL_CONFIG_STORAGE_KEY])) {
+          setConfig(stored[MODEL_CONFIG_STORAGE_KEY]);
+        }
+        if (mounted) setStorageStatus('idle');
+      } catch {
+        if (mounted) setStorageStatus('error');
+      }
+    };
+
+    void restoreConfig();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  const updateConfig = (key: keyof ModelConfig, value: string) => {
+    setConfig((current) => ({ ...current, [key]: value }));
+    if (storageStatus === 'saved' || storageStatus === 'error') setStorageStatus('idle');
+  };
+
+  const saveConfig = async () => {
+    const storage = getLocalStorageArea();
+    if (!storage) {
+      setStorageStatus('error');
+      return;
+    }
+
+    setStorageStatus('saving');
+    try {
+      await storage.set({ [MODEL_CONFIG_STORAGE_KEY]: config });
+      setStorageStatus('saved');
+    } catch {
+      setStorageStatus('error');
+    }
+  };
+
+  const statusText = {
+    loading: '正在读取本地配置',
+    idle: '配置保存在当前 Chrome 配置文件中',
+    saving: '正在保存',
+    saved: '已保存到 Chrome 本地存储',
+    error: '保存失败，请重试',
+  }[storageStatus];
 
   return (
     <main className="view settings-view">
       <div className="page-heading">
         <h1>设置</h1>
-        <p>配置用于浏览任务的模型。</p>
+        <p>使用 OpenAI API 规范连接模型服务。</p>
       </div>
       <section className="model-form" aria-labelledby="model-settings-title">
         <div className="form-heading">
           <div>
             <h2 id="model-settings-title">模型配置</h2>
-            <p>支持 OpenAI 及兼容接口。</p>
+            <p>请求格式固定为 OpenAI 标准。</p>
           </div>
-          <span>默认</span>
+          <span>OpenAI API</span>
         </div>
-        <Field label="服务商">
-          <select defaultValue="openai">
-            <option value="openai">OpenAI</option>
-            <option value="compatible">OpenAI Compatible</option>
-            <option value="ollama">Ollama</option>
-          </select>
-        </Field>
-        <Field label="API 地址" hint="填写完整的版本路径">
-          <input aria-label="API 地址" defaultValue="https://api.openai.com/v1" />
+        <Field label="API 地址" hint="填写包含 /v1 的完整接口地址">
+          <input
+            aria-label="API 地址"
+            inputMode="url"
+            value={config.apiUrl}
+            disabled={storageStatus === 'loading'}
+            onChange={(event) => updateConfig('apiUrl', event.target.value)}
+          />
         </Field>
         <Field label="API Key">
           <div className="input-with-action">
             <input
               aria-label="API Key"
               type={apiKeyVisible ? 'text' : 'password'}
-              defaultValue="sk-proj-browser-agent"
+              autoComplete="off"
+              value={config.apiKey}
+              disabled={storageStatus === 'loading'}
+              onChange={(event) => updateConfig('apiKey', event.target.value)}
             />
-            <button type="button" onClick={() => setApiKeyVisible((visible) => !visible)}>
-              {apiKeyVisible ? '隐藏' : '显示'}
+            <button
+              type="button"
+              aria-label={apiKeyVisible ? '隐藏 API Key' : '显示 API Key'}
+              onClick={() => setApiKeyVisible((visible) => !visible)}>
+              {apiKeyVisible ? <EyeSlash size={18} /> : <Eye size={18} />}
             </button>
           </div>
         </Field>
-        <Field label="模型">
-          <input aria-label="模型" defaultValue="gpt-5" />
+        <Field label="模型" hint="填写 OpenAI 模型名称">
+          <input
+            aria-label="模型"
+            value={config.model}
+            disabled={storageStatus === 'loading'}
+            onChange={(event) => updateConfig('model', event.target.value)}
+          />
         </Field>
-        <div className="parameter-fields">
-          <Field label="Temperature">
-            <input type="number" min="0" max="2" step="0.1" defaultValue="0.2" />
-          </Field>
-          <Field label="最大输出">
-            <input type="number" min="512" step="512" defaultValue="4096" />
-          </Field>
-        </div>
-        <button
-          className={`test-connection${tested ? ' is-success' : ''}`}
-          type="button"
-          onClick={() => setTested(true)}>
-          {tested && <Check size={17} weight="bold" />}
-          {tested ? '连接正常' : '测试连接'}
-        </button>
       </section>
       <div className="settings-footer">
-        <span>{saved ? '配置已保存在本地' : '配置仅保存在当前扩展中'}</span>
-        <button type="button" onClick={() => setSaved(true)}>
-          {saved && <Check size={17} weight="bold" />}
-          {saved ? '已保存' : '保存配置'}
+        <span className={storageStatus === 'error' ? 'is-error' : ''} aria-live="polite">
+          {statusText}
+        </span>
+        <button
+          type="button"
+          disabled={storageStatus === 'loading' || storageStatus === 'saving'}
+          onClick={() => void saveConfig()}>
+          {storageStatus === 'saved' && <Check size={17} weight="bold" />}
+          {storageStatus === 'saving' ? '保存中' : storageStatus === 'saved' ? '已保存' : '保存配置'}
         </button>
       </div>
     </main>

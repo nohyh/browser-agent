@@ -4,7 +4,8 @@
   "version": "1.0.0",
   "description": "Chrome Side Panel Extension",
   "permissions": [
-    "sidePanel"
+    "sidePanel",
+    "storage"
   ],
   "action": {
     "default_title": "Browser Agent"
