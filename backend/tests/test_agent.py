@@ -32,10 +32,20 @@ class ModuleBoundaryTests(unittest.TestCase):
         self.assertEqual(AgentResult.__module__, "app.models")
         self.assertEqual(AgentTokenUsage.__module__, "app.models")
 
-    def test_agent_trace_lives_in_trace_module(self):
-        from app.trace import AgentTrace
+    def test_agent_composes_trace_recorder(self):
+        from app.trace import TraceRecorder
 
-        self.assertTrue(issubclass(Agent, AgentTrace))
+        agent = Agent(
+            task="inspect",
+            browser=SimpleNamespace(),
+            llm=SimpleNamespace(),
+        )
+
+        self.assertNotIsInstance(agent, TraceRecorder)
+        self.assertIsInstance(agent.tracer, TraceRecorder)
+        self.assertIs(agent.trace, agent.tracer.events)
+        self.assertIn("_compact_task_value", Agent.__dict__)
+        self.assertFalse(hasattr(TraceRecorder, "_compact_task_value"))
 
     def test_browser_process_helpers_live_in_browser_process_module(self):
         from app.browser_process import (
@@ -482,10 +492,13 @@ class ToolFormattingTests(unittest.TestCase):
         self.assertNotIn("timeoutMs", descriptions)
         self.assertNotIn('"type": "function"', descriptions)
 
-    def test_common_tools_are_direct_and_advanced_tools_are_discovered(self):
+    def test_common_tools_and_static_getters_are_always_visible(self):
         from app.utils.tools import (
-            DISCOVERY_TOOL_NAME,
-            discover_mcp_tools,
+            COMMON_TOOL_NAMES,
+            INTERNAL_TOOL_NAMES,
+            REGISTERED_TOOL_NAMES,
+            TOOL_GROUPS,
+            get_tool_group,
             select_mcp_tools_for_llm,
         )
 
@@ -495,6 +508,7 @@ class ToolFormattingTests(unittest.TestCase):
             mcp_tool("agent_browser_read"),
             mcp_tool("agent_browser_click"),
             mcp_tool("agent_browser_wait_for_text"),
+            mcp_tool("agent_browser_network_route"),
             mcp_tool("agent_browser_network_requests"),
             mcp_tool("agent_browser_react_tree"),
             mcp_tool("agent_browser_eval"),
@@ -505,79 +519,62 @@ class ToolFormattingTests(unittest.TestCase):
             mcp_tool("agent_browser_set_viewport"),
         ]
 
-        visible = select_mcp_tools_for_llm(tools, active_tool_names=set())
+        visible = select_mcp_tools_for_llm(tools)
         visible_names = {tool.name for tool in visible}
 
         self.assertIn("agent_browser_open", visible_names)
         self.assertIn("agent_browser_read", visible_names)
         self.assertIn("agent_browser_click", visible_names)
         self.assertIn("agent_browser_wait_for_text", visible_names)
-        self.assertIn(DISCOVERY_TOOL_NAME, visible_names)
+        self.assertIn("agent_tools_get_network", visible_names)
+        self.assertIn("agent_tools_get_debug", visible_names)
+        self.assertIn("agent_tools_get_react", visible_names)
         self.assertNotIn("agent_browser_network_requests", visible_names)
         self.assertNotIn("agent_browser_react_tree", visible_names)
         self.assertNotIn("agent_browser_eval", visible_names)
         self.assertNotIn("agent_browser_snapshot", visible_names)
 
-        discovered = discover_mcp_tools(
+        network_tools = get_tool_group(
             tools,
-            category="network",
-            query="requests",
-            limit=5,
+            "agent_tools_get_network",
         )
-
         self.assertEqual(
-            [item["name"] for item in discovered],
-            ["agent_browser_network_requests"],
+            [item["name"] for item in network_tools],
+            [
+                "agent_browser_network_route",
+                "agent_browser_network_requests",
+            ],
         )
-        self.assertIn("description", discovered[0])
+        self.assertTrue(
+            all("description" in item for item in network_tools)
+        )
         self.assertEqual(
-            discover_mcp_tools(
-                tools,
-                category="advanced",
-                query="snapshot",
+            TOOL_GROUPS["agent_tools_get_network"]["tools"],
+            (
+                "agent_browser_network_route",
+                "agent_browser_network_unroute",
+                "agent_browser_network_requests",
+                "agent_browser_network_request",
+                "agent_browser_network_har_start",
+                "agent_browser_network_har_stop",
             ),
-            [],
         )
 
+        grouped_names = [
+            name
+            for group in TOOL_GROUPS.values()
+            for name in group["tools"]
+        ]
+        self.assertEqual(len(grouped_names), len(set(grouped_names)))
+        self.assertTrue(COMMON_TOOL_NAMES.isdisjoint(grouped_names))
+        self.assertTrue(INTERNAL_TOOL_NAMES.isdisjoint(REGISTERED_TOOL_NAMES))
         self.assertEqual(
-            discover_mcp_tools(
-                tools,
-                category="debug",
-                query="a11y",
-            )[0]["name"],
-            "agent_browser_a11y",
+            len(INTERNAL_TOOL_NAMES | REGISTERED_TOOL_NAMES),
+            152,
         )
         self.assertEqual(
-            discover_mcp_tools(
-                tools,
-                category="tabs",
-                query="frame",
-            )[0]["name"],
-            "agent_browser_frame_switch",
-        )
-        self.assertEqual(
-            discover_mcp_tools(
-                tools,
-                category="react",
-                query="vitals",
-            )[0]["name"],
-            "agent_browser_vitals",
-        )
-        self.assertEqual(
-            discover_mcp_tools(
-                tools,
-                category="state",
-                query="auth",
-            )[0]["name"],
-            "agent_browser_auth_list",
-        )
-        self.assertEqual(
-            discover_mcp_tools(
-                tools,
-                category="mobile",
-                query="viewport",
-            )[0]["name"],
-            "agent_browser_set_viewport",
+            REGISTERED_TOOL_NAMES,
+            COMMON_TOOL_NAMES | frozenset(grouped_names),
         )
 
 
@@ -830,7 +827,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             ["system", "user"],
         )
         self.assertNotIn("agent_browser_custom_tool", str(first_call["input"]))
-        self.assertIn("agent_tools_discover", str(first_call["input"]))
+        self.assertIn("agent_tools_get_network", str(first_call["input"]))
         self.assertIn(
             "get_title returns only the document title",
             first_call["input"][0]["content"],
@@ -1273,7 +1270,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(outcome["effect"]["page_changed"])
         self.assertTrue(outcome["effect"]["url_changed"])
 
-    async def test_discovery_activates_only_matching_category_tools(self):
+    async def test_static_getter_returns_group_without_activation(self):
         browser = FakeBrowser()
         browser.tools.append(mcp_tool("agent_browser_network_requests"))
         openai_client = FakeOpenAIClient(
@@ -1281,11 +1278,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 AgentDecision(
                     actions=[
                         AgentAction(
-                            name="agent_tools_discover",
-                            arguments={
-                                "category": "network",
-                                "query": "requests",
-                            },
+                            name="agent_tools_get_network",
                         )
                     ]
                 ),
@@ -1311,6 +1304,10 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             "agent_browser_network_requests",
             str(openai_client.responses.calls[1]["input"]),
         )
+        self.assertNotIn(
+            "agent_browser_network_requests(",
+            openai_client.responses.calls[1]["input"][0]["content"],
+        )
         self.assertEqual(
             [
                 name
@@ -1320,7 +1317,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             ["agent_browser_network_requests"],
         )
 
-    async def test_discovered_eval_refreshes_page_before_next_decision(self):
+    async def test_static_debug_getter_allows_eval_and_refreshes_page(self):
         browser = FakeBrowser(snapshot_values=["BEFORE", "AFTER"])
         browser.tools.append(mcp_tool("agent_browser_eval"))
         openai_client = FakeOpenAIClient(
@@ -1328,11 +1325,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 AgentDecision(
                     actions=[
                         AgentAction(
-                            name="agent_tools_discover",
-                            arguments={
-                                "category": "debug",
-                                "query": "eval",
-                            },
+                            name="agent_tools_get_debug",
                         )
                     ]
                 ),

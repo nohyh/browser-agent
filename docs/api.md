@@ -443,15 +443,16 @@ profile 可以重叠。`all` 是唯一不会漏掉工具的选择。
 1. companion 与一个长生命周期 MCP 进程保持连接。
 2. 所有调用传同一个 `session`。
 3. agent harness 对外暴露一组稳定基础工具。
-4. 低频能力通过 `agent_tools_discover(category, query, limit)` 按
-   network、state、debug、tabs、React 等分类在当前任务内启用。
+4. 低频能力通过无参数的 `agent_tools_get_network`、
+   `agent_tools_get_state`、`agent_tools_get_debug` 等固定入口整组获取。
 5. snapshot 由 harness 在任务开始及可能改变页面的动作后自动刷新，
    不作为普通模型工具重复暴露。
 6. 动作返回与刷新后的 URL、snapshot 指纹对比；无法验证页面变化时标记为
    `uncertain`，不能只根据工具返回成功就假设目标已经完成。
 
-当前后端仍以 `--tools all` 缓存完整 schema，但每轮只发送常用工具、当前任务已
-发现的工具和一个分类发现入口；`eval` 留在 debug 分类中作为逃生通道。
+当前后端仍以 `--tools all` 缓存完整 schema，但每轮只发送常用工具和固定工具组
+入口；getter 返回对应组的实时 MCP 签名，不维护激活状态。`eval` 留在 debug
+工具组中作为逃生通道。
 
 推荐始终可用的基础集合：
 
