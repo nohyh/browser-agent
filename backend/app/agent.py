@@ -286,8 +286,8 @@ class Agent:
                         "task_context": list(self.task_context),
                     }
                 )
-                # 这里为什么要强调decide_with_usage???
-                decision, call_usage = await self.llm.decide_with_usage(
+                # 调用 LLM 获取下一步动作决策及本轮 Token 消耗
+                decision, call_usage = await self.llm.decide(
                     observation=observation,
                     messages=self.messages,
                     task_context=self.task_context,

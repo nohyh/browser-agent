@@ -706,7 +706,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         client = SimpleNamespace(responses=InvalidThenValidResponses())
         llm = AgentLLM(client, model="test-model")
 
-        decision = await llm.decide(
+        decision, _ = await llm.decide(
             observation={"snapshot": "page"},
             messages=[{"role": "user", "content": "finish"}],
             task_context=[],

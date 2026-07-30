@@ -31,23 +31,8 @@ class AgentLLM:
         messages: list[dict[str, str]],
         task_context: list[dict[str, Any]],
         tools: list[Any],
-    ) -> AgentDecision:
-        decision, _ = await self.decide_with_usage(
-            observation=observation,
-            messages=messages,
-            task_context=task_context,
-            tools=tools,
-        )
-        return decision
-
-    async def decide_with_usage(
-        self,
-        observation: Any,
-        messages: list[dict[str, str]],
-        task_context: list[dict[str, Any]],
-        tools: list[Any],
     ) -> tuple[AgentDecision, AgentTokenUsage | None]:
-        """构造本轮决策提示词、调用底层客户端并校验结构化结果。"""
+        """构造本轮决策提示词、调用底层客户端并校验结构化结果，返回决策与 Token 消耗。"""
         task_context_text = (
             self._format_task_context(task_context)
             if task_context
