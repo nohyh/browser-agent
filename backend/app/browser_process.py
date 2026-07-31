@@ -6,7 +6,6 @@ import os
 import subprocess
 from tempfile import TemporaryFile
 
-from dotenv import load_dotenv
 from mcp import StdioServerParameters
 
 
@@ -19,16 +18,12 @@ def get_agent_browser_env() -> dict[str, str]:
     auto_connect = env.get("AGENT_BROWSER_AUTO_CONNECT", "")
     if auto_connect.strip().lower() in {"", "0", "false", "no", "off"}:
         env.pop("AGENT_BROWSER_AUTO_CONNECT", None)
-    env.setdefault(
-        "AGENT_BROWSER_SESSION",
-        os.getenv("AGENT_BROWSER_SESSION", "personal-agent"),
-    )
+    env.setdefault("AGENT_BROWSER_SESSION", "personal-agent")
     return env
 
 
 async def run_agent_browser_cli(*arguments: str) -> None:
     """调用 agent-browser CLI，用于在 MCP 接管前显式启动浏览器会话。"""
-    load_dotenv()
     if os.name == "nt":
         command = (
             "cmd.exe",
@@ -94,7 +89,6 @@ async def run_agent_browser_cli(*arguments: str) -> None:
 
 def get_server_parameters() -> StdioServerParameters:
     """根据当前操作系统构造 agent-browser MCP 的启动参数。"""
-    load_dotenv()
     env = get_agent_browser_env()
 
     if os.name == "nt":

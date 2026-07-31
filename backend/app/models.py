@@ -1,6 +1,6 @@
 """浏览器 Agent 的结构化输入输出模型。"""
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -13,18 +13,40 @@ class AgentAction(BaseModel):
 
 
 class AgentDecision(BaseModel):
-    """LLM 单轮决策：执行动作或直接给出最终答案。"""
+    """LLM 单轮决策：继续执行、确认完成或报告阻塞。"""
 
-    actions: list[AgentAction] = Field(default_factory=list)
+    status: Literal["continue", "completed", "blocked"]
+    evaluation_previous_goal: str = Field(min_length=1)
+    memory: str = Field(min_length=1)
+    next_goal: str | None = None
+    completion_evidence: list[str] = Field(default_factory=list)
+    actions: list[AgentAction] = Field(default_factory=list, max_length=3)
     final_answer: str | None = None
 
     @model_validator(mode="after")
     def validate_decision(self):
-        """保证模型不会同时返回动作和最终答案，也不会两者都不返回。"""
+        """按决策状态约束动作、最终答案、下一目标和证据。"""
         has_actions = bool(self.actions)
         has_answer = bool(self.final_answer and self.final_answer.strip())
-        if has_actions == has_answer:
-            raise ValueError("decision must contain actions or final_answer, but not both")
+        has_next_goal = bool(self.next_goal and self.next_goal.strip())
+        has_evidence = bool(
+            self.completion_evidence
+            and all(item.strip() for item in self.completion_evidence)
+        )
+        if not self.evaluation_previous_goal.strip() or not self.memory.strip():
+            raise ValueError("evaluation_previous_goal and memory cannot be blank")
+        if self.status == "continue":
+            if not has_actions or has_answer or not has_next_goal:
+                raise ValueError(
+                    "continue decision requires actions and next_goal, "
+                    "without final_answer"
+                )
+            return self
+        if has_actions or not has_answer or has_next_goal or not has_evidence:
+            raise ValueError(
+                "completed or blocked decision requires final_answer and "
+                "completion_evidence, without actions or next_goal"
+            )
         return self
 
 

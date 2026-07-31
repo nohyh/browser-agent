@@ -15,7 +15,7 @@ from app.models import (
     AgentTokenUsage,
 )
 from app.trace import TraceRecorder, extract_snapshot, redact_value
-from app.utils import (
+from app.utils.tools import (
     REGISTERED_TOOL_NAMES,
     TOOL_GETTER_NAMES,
     get_tool_group,
@@ -58,8 +58,8 @@ OBSERVATION_REQUIRED_ACTIONS = {
     "agent_browser_state_load",
     "agent_browser_connect",
 }
-
-MAX_TASK_CONTEXT_ITEMS = 8
+#压缩时保留最近两轮的原始对话记录不被压缩
+CONVERSATION_KEEP_RECENT_TURNS = 2
 BARE_REF_SELECTOR_PATTERN = re.compile(r"^\s*@?(e\d+)\s*$", re.IGNORECASE)
 ATTRIBUTE_REF_SELECTOR_PATTERN = re.compile(
     r"""^\s*\[\s*ref\s*=\s*['"]?(e\d+)['"]?\s*\]\s*$""",
@@ -206,9 +206,15 @@ class Agent:
         trace_file: Path | None = None,
     ):
         initial_message = {"role": "user", "content": task}
-        # messages 保存持续对话；task_context 只服务当前任务；trace 仅用于完整复盘。
+        # messages 保存完整对话；task_context 只保存当前任务的运行信息。
         self.messages: list[dict[str, str]] = [initial_message]
         self.task_context: list[dict[str, Any]] = []
+        self._current_pages: list[dict[str, str]] = []
+        #之前对话的概括
+        self._conversation_summary: str | None = None
+        #前面被压缩的消息总数，作为指针继续压缩未压缩的部分
+        self._summary_message_count = 0
+        self._conversation_compaction_attempted = False
         self.tracer = TraceRecorder(trace_file, self._tool_outcome)
         self._record({"type": "message", **initial_message})
         self.browser = browser
@@ -219,10 +225,6 @@ class Agent:
     @property
     def trace(self) -> list[dict[str, Any]]:
         return self.tracer.events
-
-    @property
-    def trace_file(self) -> Path | None:
-        return self.tracer.trace_file
 
     def _record(self, event: dict[str, Any]) -> None:
         self.tracer.record(event)
@@ -239,6 +241,7 @@ class Agent:
         """追加用户消息，并同步写入不参与模型上下文的完整记录。"""
         message = {"role": "user", "content": content}
         self.messages.append(message)
+        self._conversation_compaction_attempted = False
         self._record({"type": "message", **message})
 
     async def run(self, browser_session_id: str) -> AgentResult:
@@ -257,12 +260,13 @@ class Agent:
         observation_required = True
         pending_outcome: dict[str, Any] | None = None
         pending_fingerprint: tuple[str | None, str] | None = None
-        token_usage: AgentTokenUsage | None = None
+        token_usage = await self._maybe_compact_conversation()
 
         for _ in range(self.max_steps):
             try:
                 if observation_required:
                     observation = await self.observe(browser_session_id)
+                    self._record_page_visit(observation)
                     new_fingerprint = self._page_fingerprint(observation)
                     if pending_outcome is not None:
                         self._apply_page_effect(
@@ -277,21 +281,24 @@ class Agent:
 
                 visible_tools = select_mcp_tools_for_llm(self.browser.tools)
                 allowed_names = REGISTERED_TOOL_NAMES | TOOL_GETTER_NAMES
+                llm_task_context = self._llm_task_context()
+                llm_messages = self._llm_messages()
                 self._record(
                     {
                         "type": "llm_call",
                         "browser_session_id": browser_session_id,
                         "observation": observation,
-                        "messages": list(self.messages),
-                        "task_context": list(self.task_context),
+                        "messages": llm_messages,
+                        "task_context": llm_task_context,
                     }
                 )
                 # 调用 LLM 获取下一步动作决策及本轮 Token 消耗
                 decision, call_usage = await self.llm.decide(
                     observation=observation,
-                    messages=self.messages,
-                    task_context=self.task_context,
+                    messages=llm_messages,
+                    task_context=llm_task_context,
                     tools=visible_tools,
+                    conversation_summary=self._conversation_summary,
                 )
                 if call_usage is not None:
                     token_usage = (
@@ -321,16 +328,28 @@ class Agent:
                     token_usage=token_usage,
                 )
 
-            # 如果llm返回了最终结果，直接结束
-            if decision.final_answer:
+            if decision.status in {"completed", "blocked"}:
                 return self._finish(
-                    success=True,
+                    success=decision.status == "completed",
                     answer=decision.final_answer,
                     token_usage=token_usage,
+                    status=decision.status,
                 )
 
+            # 将模型确认的进度放入下一轮上下文，避免长任务只依赖工具结果。
+            self._append_task_context(
+                {
+                    "type": "agent_progress",
+                    "evaluation_previous_goal": (
+                        decision.evaluation_previous_goal
+                    ),
+                    "memory": decision.memory,
+                    "next_goal": decision.next_goal,
+                }
+            )
+
             # 限制单轮动作数量，避免模型一次生成过长且难以验证的操作链。
-            for action in decision.actions[:3]:
+            for action in decision.actions:
                 action = self._normalize_action(action)
                 if action.name not in allowed_names:
                     rejected_result = self._tool_outcome(
@@ -542,9 +561,6 @@ class Agent:
   const visual = window.__browserAgentVisual;
   if (!visual || !visual.cursor) return false;
   visual.move({x:.1f}, {y:.1f}, {click_literal});
-  visual.cursor.style.transform =
-    'translate3d({x:.1f}px, {y:.1f}px, 0)';
-  visual.cursor.classList.toggle('is-clicking', {click_literal});
   return true;
 }})()
 """
@@ -553,12 +569,180 @@ class Agent:
         self,
         item: dict[str, Any],
     ) -> dict[str, Any]:
-        """只保留当前任务最近的结构化结果，避免操作历史无限累积。"""
+        """保存当前任务的最新进度或完整工具结果，任务结束后再精简。"""
         stored_item = self._compact_task_value(redact_value(item))
+        if stored_item.get("type") == "agent_progress":
+            self.task_context[:] = [
+                existing
+                for existing in self.task_context
+                if existing.get("type") != "agent_progress"
+            ]
         self.task_context.append(stored_item)
-        if len(self.task_context) > MAX_TASK_CONTEXT_ITEMS:
-            del self.task_context[:-MAX_TASK_CONTEXT_ITEMS]
         return stored_item
+
+    def _llm_task_context(self) -> list[dict[str, Any]]:
+        """组合当前任务页面、工具结果和最新进度。"""
+        context: list[dict[str, Any]] = []
+        if self._current_pages:
+            context.append(
+                {
+                    "type": "current_task_pages",
+                    "pages": [dict(page) for page in self._current_pages],
+                }
+            )
+        context.extend(dict(item) for item in self.task_context)
+        return context
+
+    def _llm_messages(self) -> list[dict[str, str]]:
+        """只把尚未进入历史摘要的完整对话轮次交给决策模型。"""
+        return [
+            dict(message)
+            for message in self.messages[self._summary_message_count :]
+        ]
+
+    async def _maybe_compact_conversation(
+        self,
+    ) -> AgentTokenUsage | None:
+        """对话过长时压缩较早完整轮次，同时保留原始消息供展示。"""
+        if self._conversation_compaction_attempted:
+            return None
+        self._conversation_compaction_attempted = True
+        unsummarized = self.messages[self._summary_message_count :]
+        context_size = len(self._conversation_summary or "") + sum(
+            len(message.get("content", ""))
+            for message in unsummarized
+        )
+        if (
+            context_size <= self.llm.CONVERSATION_CONTEXT_LIMIT
+            and len(unsummarized) <= self.llm.MESSAGE_LIMIT
+        ):
+            return None
+
+        completed_end = len(self.messages)
+        if (
+            completed_end > self._summary_message_count
+            and self.messages[-1].get("role") == "user"
+        ):
+            completed_end -= 1
+        compact_end = max(
+            self._summary_message_count,
+            completed_end - (CONVERSATION_KEEP_RECENT_TURNS * 2),
+        )
+        if compact_end <= self._summary_message_count:
+            return None
+
+        old_messages = self.messages[
+            self._summary_message_count : compact_end
+        ]
+        try:
+            summary, usage = await self.llm.compact_conversation_history(
+                previous_summary=self._conversation_summary,
+                messages=old_messages,
+            )
+        except Exception as exc:
+            self._record(
+                {
+                    "type": "error",
+                    "stage": "conversation_compaction",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc) or type(exc).__name__,
+                }
+            )
+            return None
+
+        self._conversation_summary = summary
+        self._summary_message_count = compact_end
+        return usage
+
+    def _record_page_visit(self, observation: Any) -> None:
+        """从最新观察提取 URL/title，并按访问顺序去除连续重复页面。"""
+        page = self._extract_page_visit(observation)
+        if page is None or (
+            self._current_pages and self._current_pages[-1] == page
+        ):
+            return
+        self._current_pages.append(page)
+
+    @classmethod
+    def _extract_page_visit(cls, value: Any) -> dict[str, str] | None:
+        if not isinstance(value, dict):
+            return None
+        url = value.get("url") or value.get("origin")
+        title = value.get("title")
+        if isinstance(url, str) or isinstance(title, str):
+            page: dict[str, str] = {}
+            if isinstance(url, str) and url:
+                page["url"] = str(redact_value(url))
+            if isinstance(title, str) and title:
+                page["title"] = str(redact_value(title))
+            return page or None
+        for key in ("data", "response"):
+            page = cls._extract_page_visit(value.get(key))
+            if page is not None:
+                return page
+        return None
+
+    @classmethod
+    def _completed_action(
+        cls,
+        tool_result: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """把运行期工具结果收敛为历史对话中的动作、参数和状态。"""
+        if tool_result.get("type") != "tool_result":
+            return None
+        name = tool_result.get("name")
+        if (
+            not isinstance(name, str)
+            or name == "agent_browser_snapshot"
+            or name in TOOL_GETTER_NAMES
+        ):
+            return None
+        action = {
+            "name": name,
+            "arguments": cls._compact_task_value(
+                redact_value(tool_result.get("arguments") or {})
+            ),
+            "status": tool_result.get("status") or "unknown",
+        }
+        error = tool_result.get("error")
+        if error:
+            action["error"] = cls._compact_task_value(error)
+        return action
+
+    def _assistant_history_content(
+        self,
+        status: str,
+        answer: str,
+    ) -> str:
+        """把当前 task_context 过滤为执行过程，并与最终回答交错保存。"""
+        actions = [
+            action
+            for tool_result in self.task_context
+            if (action := self._completed_action(tool_result)) is not None
+        ]
+        sections = []
+        if self._current_pages or actions:
+            process = {
+                "pages": [dict(page) for page in self._current_pages],
+                "actions": actions,
+            }
+            sections.append(
+                "<执行过程>\n"
+                + json.dumps(
+                    process,
+                    ensure_ascii=False,
+                    default=str,
+                )
+                + "\n</执行过程>"
+            )
+        sections.append(
+            f'<最终回答 status="{status}">{answer}</最终回答>'
+        )
+        return "\n\n".join(sections)
+
+    def _clear_current_task_context(self) -> None:
+        self.task_context.clear()
+        self._current_pages.clear()
 
     @classmethod
     def _compact_task_value(cls, value: Any) -> Any:
@@ -733,9 +917,17 @@ class Agent:
         success: bool,
         answer: str,
         token_usage: AgentTokenUsage | None = None,
+        status: str | None = None,
     ) -> AgentResult:
-        """将任务结果写回对话和 trace，并清理当前任务上下文。"""
-        message = {"role": "assistant", "content": answer}
+        """把执行过程与最终回答写入对话，并清理当前任务上下文。"""
+        final_status = status or ("completed" if success else "failed")
+        message = {
+            "role": "assistant",
+            "content": self._assistant_history_content(
+                status=final_status,
+                answer=answer,
+            ),
+        }
         self.messages.append(message)
         self._record({"type": "message", **message})
         if token_usage is not None:
@@ -745,7 +937,7 @@ class Agent:
                     "usage": token_usage.model_dump(),
                 }
             )
-        self.task_context.clear()
+        self._clear_current_task_context()
         return AgentResult(
             success=success,
             answer=answer,

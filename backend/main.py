@@ -87,11 +87,10 @@ async def lifespan(app: FastAPI):
             "OPENAI_API_KEY and OPENAI_MODEL must be set before startup"
         )
 
-    client_options = {"api_key": api_key}
-    base_url = os.getenv("OPENAI_BASE_URL")
-    if base_url:
-        client_options["base_url"] = base_url
-    openai_client = AsyncOpenAI(**client_options)
+    openai_client = AsyncOpenAI(
+        api_key=api_key,
+        base_url=os.getenv("OPENAI_BASE_URL") or None,
+    )
     app.state.agent_llm = AgentLLM(openai_client, model=model)
     app.state.agents = {}
 
@@ -231,12 +230,7 @@ async def run_agent(
     browser: BrowserDep,
 ) -> AgentResult:
     """执行新任务，或在已有会话中继续对话。"""
-    if (
-        not browser.is_session_ready(payload.browser_session_id)
-        or not await browser.refresh_session_ready(
-            payload.browser_session_id
-        )
-    ):
+    if not await browser.refresh_session_ready(payload.browser_session_id):
         raise HTTPException(
             status_code=409,
             detail=(
