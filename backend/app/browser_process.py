@@ -4,25 +4,104 @@ import asyncio
 import json
 import os
 import subprocess
+from pathlib import Path
 from tempfile import TemporaryFile
+from urllib.request import urlopen
 
 from mcp import StdioServerParameters
 
 
 BROWSER_SESSION_START_TIMEOUT_SECONDS = 35
+# Chrome 系浏览器常用的远程调试端口，按命中概率排序。
+CDP_DISCOVERY_PORTS = (9222, 9223, 9333, 9229, 21222)
+CDP_DISCOVERY_TIMEOUT_SECONDS = 1.2
+# 独立 profile 落在后端目录内，避免污染用户真实浏览器数据。
+ISOLATED_PROFILE_ROOT = Path(__file__).parent.parent / ".profiles"
 
 
-def get_agent_browser_env() -> dict[str, str]:
+def get_agent_browser_env(
+    overrides: dict[str, str | None] | None = None,
+) -> dict[str, str]:
     """构造 agent-browser 环境，并移除会被误判为启用的 false 值。"""
     env = dict(os.environ)
     auto_connect = env.get("AGENT_BROWSER_AUTO_CONNECT", "")
     if auto_connect.strip().lower() in {"", "0", "false", "no", "off"}:
         env.pop("AGENT_BROWSER_AUTO_CONNECT", None)
     env.setdefault("AGENT_BROWSER_SESSION", "personal-agent")
+    # 值为 None 表示显式删除，避免上层 .env 的模式设置泄漏到本次启动。
+    for key, value in (overrides or {}).items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
     return env
 
 
-async def run_agent_browser_cli(*arguments: str) -> None:
+def isolated_profile_env(browser_session_id: str) -> dict[str, str | None]:
+    """独立会话使用后端自己的 profile 目录，并强制有头模式。"""
+    profile_dir = ISOLATED_PROFILE_ROOT / browser_session_id
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        "AGENT_BROWSER_PROFILE": str(profile_dir),
+        "AGENT_BROWSER_HEADED": "true",
+        "AGENT_BROWSER_AUTO_CONNECT": None,
+        "AGENT_BROWSER_CDP": None,
+    }
+
+
+def existing_browser_env(cdp_url: str) -> dict[str, str | None]:
+    """接管现有浏览器时只允许 CDP 上下文，不能同时给出 profile。"""
+    return {
+        "AGENT_BROWSER_CDP": cdp_url,
+        "AGENT_BROWSER_AUTO_CONNECT": None,
+        "AGENT_BROWSER_PROFILE": None,
+        "AGENT_BROWSER_HEADED": None,
+    }
+
+
+def _probe_cdp_port(port: int) -> str | None:
+    """探测单个本地端口是否是可用的 CDP 端点。"""
+    try:
+        with urlopen(
+            f"http://127.0.0.1:{port}/json/version",
+            timeout=CDP_DISCOVERY_TIMEOUT_SECONDS,
+        ) as response:
+            payload = json.loads(
+                response.read().decode("utf-8", errors="replace")
+            )
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    websocket_url = payload.get("webSocketDebuggerUrl")
+    if isinstance(websocket_url, str) and websocket_url.startswith("ws"):
+        return websocket_url
+    return f"http://127.0.0.1:{port}"
+
+
+async def discover_cdp_url(
+    ports: tuple[int, ...] | None = None,
+) -> str | None:
+    """并发探测常见端口，返回用户当前浏览器的 CDP 地址。"""
+    candidates = ports or CDP_DISCOVERY_PORTS
+    configured = os.getenv("AGENT_BROWSER_CDP", "").strip()
+    if configured:
+        return configured
+
+    results = await asyncio.gather(
+        *(asyncio.to_thread(_probe_cdp_port, port) for port in candidates)
+    )
+    for found in results:
+        if found:
+            return found
+    return None
+
+
+async def run_agent_browser_cli(
+    *arguments: str,
+    env_overrides: dict[str, str | None] | None = None,
+) -> None:
     """调用 agent-browser CLI，用于在 MCP 接管前显式启动浏览器会话。"""
     if os.name == "nt":
         command = (
@@ -45,7 +124,7 @@ async def run_agent_browser_cli(*arguments: str) -> None:
                 check=False,
                 stdout=stdout_file,
                 stderr=stderr_file,
-                env=get_agent_browser_env(),
+                env=get_agent_browser_env(env_overrides),
                 timeout=BROWSER_SESSION_START_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired as exc:

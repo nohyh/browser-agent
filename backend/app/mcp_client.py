@@ -7,7 +7,11 @@ from typing import Any, List, Literal
 
 from mcp import ClientSession
 
-from app.browser_process import run_agent_browser_cli
+from app.browser_process import (
+    existing_browser_env,
+    isolated_profile_env,
+    run_agent_browser_cli,
+)
 
 
 BROWSER_TOOL_TIMEOUT_SECONDS = 30
@@ -109,8 +113,17 @@ class BrowserService:
             # get url 可以完成冷启动探测，同时不会重置已有页面。
             arguments.extend(["get", "url", "--json"])
 
+            # 根据模式选择正确的环境变量，避免 .env 的全局模式泄漏到本次启动。
+            if mode == "existing" and cdp_url is not None:
+                env_overrides = existing_browser_env(cdp_url)
+            else:
+                env_overrides = isolated_profile_env(browser_session_id)
+
             try:
-                await run_agent_browser_cli(*arguments)
+                await run_agent_browser_cli(
+                    *arguments,
+                    env_overrides=env_overrides,
+                )
                 result = await self.call_tool(
                     browser_session_id=browser_session_id,
                     name="agent_browser_get_url",

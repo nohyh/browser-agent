@@ -12,9 +12,18 @@ import {
 } from '@phosphor-icons/react';
 import { FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import './App.css';
+import {
+  AgentEvent,
+  AgentStreamController,
+  cancelAgent,
+  discoverBrowser,
+  runAgentStream,
+  startBrowserSession,
+} from './api';
 
 type View = 'chat' | 'settings';
-type MessageRole = 'user' | 'assistant';
+type MessageRole = 'user' | 'assistant' | 'system';
+type BrowserMode = 'isolated' | 'existing';
 
 interface Message {
   id: string;
@@ -42,8 +51,11 @@ const MODEL_CONFIG_STORAGE_KEY = 'modelConfig';
 const DEFAULT_MODEL_CONFIG: ModelConfig = {
   apiUrl: 'https://api.openai.com/v1',
   apiKey: '',
-  model: 'gpt-5',
+  model: 'gpt-4o',
 };
+
+const BROWSER_SESSION_ID = 'extension-main';
+const CONVERSATION_ID = 'default';
 
 function isModelConfig(value: unknown): value is ModelConfig {
   if (!value || typeof value !== 'object') return false;
@@ -57,11 +69,11 @@ function isModelConfig(value: unknown): value is ModelConfig {
 }
 
 function getLocalStorageArea() {
-  // 普通网页预览没有扩展 API，实际扩展环境会使用 chrome.storage.local。
   if (typeof chrome === 'undefined' || !chrome.storage?.local) return null;
   return chrome.storage.local;
 }
 
+// Mock sessions for history drawer (real sessions would come from backend)
 const sessions: Session[] = [
   {
     id: 'research',
@@ -96,24 +108,6 @@ const sessions: Session[] = [
         id: 'flight-assistant',
         role: 'assistant',
         content: '找到 4 个符合时间偏好的直飞选项。需要你确认是否接受周六早班。',
-      },
-    ],
-  },
-  {
-    id: 'docs',
-    title: '提取 API 文档要点',
-    preview: '完成鉴权、限流和错误码摘要',
-    updatedAt: '7 月 26 日',
-    messages: [
-      {
-        id: 'docs-user',
-        role: 'user',
-        content: '阅读当前页面的 API 文档，提取鉴权、限流和常见错误。',
-      },
-      {
-        id: 'docs-assistant',
-        role: 'assistant',
-        content: '已整理鉴权流程、限流规则和常见错误码。',
       },
     ],
   },
@@ -246,18 +240,80 @@ function SessionDrawer({
   );
 }
 
-function EmptyChat() {
+function BrowserModeSelector({
+  mode,
+  onModeChange,
+  discovering,
+}: {
+  mode: BrowserMode;
+  onModeChange: (mode: BrowserMode) => void;
+  discovering: boolean;
+}) {
   return (
-    <div className="empty-chat">
-      <h1>需要我做什么？</h1>
-      <p>告诉我你想在当前网页完成的任务。</p>
+    <div className="browser-mode-selector">
+      <label>
+        <input
+          type="radio"
+          name="browser-mode"
+          value="existing"
+          checked={mode === 'existing'}
+          disabled={discovering}
+          onChange={(e) => onModeChange(e.target.value as BrowserMode)}
+        />
+        <span>使用当前浏览器</span>
+      </label>
+      <label>
+        <input
+          type="radio"
+          name="browser-mode"
+          value="isolated"
+          checked={mode === 'isolated'}
+          disabled={discovering}
+          onChange={(e) => onModeChange(e.target.value as BrowserMode)}
+        />
+        <span>打开独立 Profile</span>
+      </label>
     </div>
   );
 }
 
-function MessageThread({ messages, running }: { messages: Message[]; running: boolean }) {
+function EmptyChat({
+  mode,
+  onModeChange,
+  discovering,
+}: {
+  mode: BrowserMode;
+  onModeChange: (mode: BrowserMode) => void;
+  discovering: boolean;
+}) {
   return (
-    <div className="message-thread">
+    <div className="empty-chat">
+      <h1>需要我做什么？</h1>
+      <p>告诉我你想在网页中完成的任务。</p>
+      <BrowserModeSelector mode={mode} onModeChange={onModeChange} discovering={discovering} />
+    </div>
+  );
+}
+
+function MessageThread({
+  messages,
+  running,
+  currentGoal,
+}: {
+  messages: Message[];
+  running: boolean;
+  currentGoal: string;
+}) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [messages, running, currentGoal]);
+
+  return (
+    <div className="message-thread" ref={scrollRef}>
       {messages.map((message) => (
         <div className={`message ${message.role}`} key={message.id}>
           {message.role === 'assistant' && (
@@ -266,7 +322,9 @@ function MessageThread({ messages, running }: { messages: Message[]; running: bo
             </span>
           )}
           <div className="message-body">
-            <span className="message-author">{message.role === 'user' ? '你' : 'Browser Agent'}</span>
+            <span className="message-author">
+              {message.role === 'user' ? '你' : message.role === 'system' ? '系统' : 'Browser Agent'}
+            </span>
             <p>{message.content}</p>
           </div>
         </div>
@@ -278,7 +336,7 @@ function MessageThread({ messages, running }: { messages: Message[]; running: bo
           </span>
           <div className="message-body">
             <span className="message-author">Browser Agent</span>
-            <p className="running-copy">正在处理当前页面...</p>
+            <p className="running-copy">{currentGoal || '正在处理...'}</p>
           </div>
         </div>
       )}
@@ -292,12 +350,18 @@ function Composer({
   onChange,
   onSubmit,
   onStop,
+  mode,
+  onModeChange,
+  discovering,
 }: {
   value: string;
   running: boolean;
   onChange: (value: string) => void;
   onSubmit: () => void;
   onStop: () => void;
+  mode: BrowserMode;
+  onModeChange: (mode: BrowserMode) => void;
+  discovering: boolean;
 }) {
   const handleSubmit = (event: FormEvent) => {
     event.preventDefault();
@@ -306,13 +370,14 @@ function Composer({
 
   return (
     <div className="composer-wrap">
+      <BrowserModeSelector mode={mode} onModeChange={onModeChange} discovering={discovering} />
       <form className="composer" onSubmit={handleSubmit}>
         <textarea
           aria-label="任务内容"
-          placeholder="描述你想在当前网页完成的任务"
+          placeholder="描述你想在网页中完成的任务"
           rows={3}
           value={value}
-          disabled={running}
+          disabled={running || discovering}
           onChange={(event) => onChange(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
@@ -330,7 +395,11 @@ function Composer({
               停止
             </button>
           ) : (
-            <button className="send-button" type="submit" aria-label="发送任务" disabled={!value.trim()}>
+            <button
+              className="send-button"
+              type="submit"
+              aria-label="发送任务"
+              disabled={!value.trim() || discovering}>
               <ArrowUp size={18} weight="bold" />
             </button>
           )}
@@ -344,18 +413,26 @@ function ChatView({
   activeSession,
   messages,
   running,
+  currentGoal,
   draft,
   onDraftChange,
   onSubmit,
   onStop,
+  mode,
+  onModeChange,
+  discovering,
 }: {
   activeSession: Session | null;
   messages: Message[];
   running: boolean;
+  currentGoal: string;
   draft: string;
   onDraftChange: (value: string) => void;
   onSubmit: () => void;
   onStop: () => void;
+  mode: BrowserMode;
+  onModeChange: (mode: BrowserMode) => void;
+  discovering: boolean;
 }) {
   return (
     <main className="view chat-view">
@@ -365,7 +442,11 @@ function ChatView({
         </div>
       )}
       <div className="chat-scroll">
-        {messages.length || running ? <MessageThread messages={messages} running={running} /> : <EmptyChat />}
+        {messages.length || running ? (
+          <MessageThread messages={messages} running={running} currentGoal={currentGoal} />
+        ) : (
+          <EmptyChat mode={mode} onModeChange={onModeChange} discovering={discovering} />
+        )}
       </div>
       <Composer
         value={draft}
@@ -373,20 +454,15 @@ function ChatView({
         onChange={onDraftChange}
         onSubmit={onSubmit}
         onStop={onStop}
+        mode={mode}
+        onModeChange={onModeChange}
+        discovering={discovering}
       />
     </main>
   );
 }
 
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: ReactNode;
-}) {
+function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
   return (
     <div className="field">
       <label>
@@ -532,66 +608,170 @@ export default function App() {
   const [draft, setDraft] = useState('');
   const [sessionsOpen, setSessionsOpen] = useState(false);
   const [running, setRunning] = useState(false);
-  const completionTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  useEffect(
-    () => () => {
-      if (completionTimer.current) clearTimeout(completionTimer.current);
-    },
-    [],
-  );
+  const [currentGoal, setCurrentGoal] = useState('');
+  const [browserMode, setBrowserMode] = useState<BrowserMode>('isolated');
+  const [discovering, setDiscovering] = useState(false);
+  const [sessionReady, setSessionReady] = useState(false);
+  const streamController = useRef<AgentStreamController | null>(null);
 
   const startNewChat = () => {
-    if (completionTimer.current) clearTimeout(completionTimer.current);
+    if (streamController.current) {
+      streamController.current.abort();
+      streamController.current = null;
+    }
     setActiveView('chat');
     setActiveSession(null);
     setMessages([]);
     setDraft('');
     setRunning(false);
+    setCurrentGoal('');
     setSessionsOpen(false);
+    setSessionReady(false);
   };
 
   const selectSession = (session: Session) => {
-    if (completionTimer.current) clearTimeout(completionTimer.current);
+    if (streamController.current) {
+      streamController.current.abort();
+      streamController.current = null;
+    }
     setActiveSession(session);
     setMessages(session.messages);
     setRunning(false);
+    setCurrentGoal('');
     setActiveView('chat');
     setSessionsOpen(false);
   };
 
-  const submitTask = () => {
-    const content = draft.trim();
-    if (!content || running) return;
+  const ensureBrowserSession = async (): Promise<boolean> => {
+    if (sessionReady) return true;
 
-    setMessages((current) => [
-      ...current,
-      {
-        id: `user-${Date.now()}`,
-        role: 'user',
-        content,
-      },
-    ]);
-    setDraft('');
-    setRunning(true);
+    try {
+      let cdp_url: string | undefined;
 
-    // 后端尚未接线，暂时用短反馈展示完整聊天状态。
-    completionTimer.current = setTimeout(() => {
+      if (browserMode === 'existing') {
+        setDiscovering(true);
+        const result = await discoverBrowser();
+        setDiscovering(false);
+
+        if (!result.cdp_url) {
+          setMessages((current) => [
+            ...current,
+            {
+              id: `system-${Date.now()}`,
+              role: 'system',
+              content:
+                '未找到开启调试端口的 Chrome 浏览器。请使用 --remote-debugging-port=9222 启动 Chrome，或切换到"独立 Profile"模式。',
+            },
+          ]);
+          return false;
+        }
+
+        cdp_url = result.cdp_url;
+      }
+
+      await startBrowserSession(BROWSER_SESSION_ID, browserMode, cdp_url);
+      setSessionReady(true);
+      return true;
+    } catch (error) {
       setMessages((current) => [
         ...current,
         {
-          id: `assistant-${Date.now()}`,
-          role: 'assistant',
-          content: '已收到任务。接入后端后，这里会显示真实的执行结果。',
+          id: `system-${Date.now()}`,
+          role: 'system',
+          content: `浏览器会话启动失败: ${error instanceof Error ? error.message : String(error)}`,
         },
       ]);
-      setRunning(false);
-    }, 900);
+      return false;
+    }
   };
 
-  const stopTask = () => {
-    if (completionTimer.current) clearTimeout(completionTimer.current);
+  const submitTask = async () => {
+    const content = draft.trim();
+    if (!content || running) return;
+
+    const ready = await ensureBrowserSession();
+    if (!ready) return;
+
+    const userMessage: Message = {
+      id: `user-${Date.now()}`,
+      role: 'user',
+      content,
+    };
+
+    setMessages((current) => [...current, userMessage]);
+    setDraft('');
+    setRunning(true);
+    setCurrentGoal('正在启动...');
+
+    const controller = runAgentStream(
+      {
+        message: content,
+        conversation_id: CONVERSATION_ID,
+        browser_session_id: BROWSER_SESSION_ID,
+      },
+      {
+        onEvent: (event: AgentEvent) => {
+          if (event.type === 'progress') {
+            setCurrentGoal(event.next_goal || '处理中...');
+          } else if (event.type === 'action') {
+            setCurrentGoal(`正在执行: ${event.name}`);
+          } else if (event.type === 'step') {
+            const action = event.action === 'observe' ? '观察页面' : '思考决策';
+            setCurrentGoal(`步骤 ${event.step + 1}: ${action}`);
+          }
+        },
+        onDone: (event) => {
+          setRunning(false);
+          setCurrentGoal('');
+          setMessages((current) => [
+            ...current,
+            {
+              id: `assistant-${Date.now()}`,
+              role: 'assistant',
+              content: event.answer || '任务完成',
+            },
+          ]);
+        },
+        onError: (error) => {
+          setRunning(false);
+          setCurrentGoal('');
+          setMessages((current) => [
+            ...current,
+            {
+              id: `system-${Date.now()}`,
+              role: 'system',
+              content: `错误: ${error.message}`,
+            },
+          ]);
+        },
+      },
+    );
+
+    streamController.current = controller;
+  };
+
+  const stopTask = async () => {
+    if (streamController.current) {
+      streamController.current.abort();
+      streamController.current = null;
+    }
+
+    try {
+      await cancelAgent(CONVERSATION_ID);
+    } catch {
+      // Ignore cancel errors (404 if already finished)
+    }
+
     setRunning(false);
+    setCurrentGoal('');
+    setMessages((current) => [
+      ...current,
+      {
+        id: `system-${Date.now()}`,
+        role: 'system',
+        content: '任务已取消',
+      },
+    ]);
   };
 
   return (
@@ -609,10 +789,14 @@ export default function App() {
             activeSession={activeSession}
             messages={messages}
             running={running}
+            currentGoal={currentGoal}
             draft={draft}
             onDraftChange={setDraft}
-            onSubmit={submitTask}
-            onStop={stopTask}
+            onSubmit={() => void submitTask()}
+            onStop={() => void stopTask()}
+            mode={browserMode}
+            onModeChange={setBrowserMode}
+            discovering={discovering}
           />
         ) : (
           <SettingsView />

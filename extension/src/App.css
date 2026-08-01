@@ -426,6 +426,48 @@ textarea:disabled {
   font-weight: 600;
 }
 
+.browser-mode-selector {
+  display: flex;
+  gap: 12px;
+  padding: 0 16px 16px;
+}
+
+.browser-mode-selector label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  font-size: 13px;
+  color: var(--body);
+  cursor: pointer;
+  transition: all 150ms ease;
+}
+
+.browser-mode-selector label:has(input:checked) {
+  border-color: var(--coral);
+  background: var(--coral-soft);
+  color: var(--ink);
+}
+
+.browser-mode-selector label:has(input:disabled) {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.browser-mode-selector input[type="radio"] {
+  margin: 0;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--coral-strong);
+}
+
+.browser-mode-selector span {
+  font-weight: 500;
+}
+
 .settings-view {
   padding: 25px 16px 24px;
   overflow-y: auto;

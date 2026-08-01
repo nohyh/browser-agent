@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Coroutine
 
 from app.llm import AgentLLM
 from app.mcp_client import BrowserService
@@ -21,6 +21,9 @@ from app.utils.tools import (
     get_tool_group,
     select_mcp_tools_for_llm,
 )
+
+# 可选的 SSE 事件回调类型。
+EmitCallback = Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
 
 
 OBSERVATION_REQUIRED_ACTIONS = {
@@ -204,6 +207,7 @@ class Agent:
         llm: AgentLLM,
         max_steps: int = 20,
         trace_file: Path | None = None,
+        emit: "EmitCallback | None" = None,
     ):
         initial_message = {"role": "user", "content": task}
         # messages 保存完整对话；task_context 只保存当前任务的运行信息。
@@ -221,6 +225,10 @@ class Agent:
         self.llm = llm
         self.max_steps = max_steps
         self._visual_overlay_started = False
+        # SSE 推送回调；None 表示非流式模式。
+        self._emit = emit
+        # 取消标志；由外部通过 cancel() 设置。
+        self._cancelled = False
 
     @property
     def trace(self) -> list[dict[str, Any]]:
@@ -228,6 +236,18 @@ class Agent:
 
     def _record(self, event: dict[str, Any]) -> None:
         self.tracer.record(event)
+
+    def cancel(self) -> None:
+        """外部通过 cancel() 请求停止当前运行中的 Agent。"""
+        self._cancelled = True
+
+    async def _emit_event(self, event: dict[str, Any]) -> None:
+        """安全地推送 SSE 事件，emit 为 None 时静默跳过。"""
+        if self._emit is not None:
+            try:
+                await self._emit(event)
+            except Exception:
+                pass
 
     async def observe(self, browser_session_id: str) -> Any:
         """获取当前页面的交互元素快照，作为本轮唯一页面状态。"""
@@ -262,9 +282,21 @@ class Agent:
         pending_fingerprint: tuple[str | None, str] | None = None
         token_usage = await self._maybe_compact_conversation()
 
-        for _ in range(self.max_steps):
+        for step in range(self.max_steps):
+            # 每步开始前检查取消请求。
+            if self._cancelled:
+                return self._finish(
+                    success=False,
+                    answer="任务已被用户取消。",
+                    token_usage=token_usage,
+                    status="cancelled",
+                )
+
             try:
                 if observation_required:
+                    await self._emit_event(
+                        {"type": "step", "step": step, "action": "observe"}
+                    )
                     observation = await self.observe(browser_session_id)
                     self._record_page_visit(observation)
                     new_fingerprint = self._page_fingerprint(observation)
@@ -291,6 +323,9 @@ class Agent:
                         "messages": llm_messages,
                         "task_context": llm_task_context,
                     }
+                )
+                await self._emit_event(
+                    {"type": "step", "step": step, "action": "think"}
                 )
                 # 调用 LLM 获取下一步动作决策及本轮 Token 消耗
                 decision, call_usage = await self.llm.decide(
@@ -329,6 +364,13 @@ class Agent:
                 )
 
             if decision.status in {"completed", "blocked"}:
+                await self._emit_event(
+                    {
+                        "type": "done",
+                        "status": decision.status,
+                        "answer": decision.final_answer,
+                    }
+                )
                 return self._finish(
                     success=decision.status == "completed",
                     answer=decision.final_answer,
@@ -343,6 +385,14 @@ class Agent:
                     "evaluation_previous_goal": (
                         decision.evaluation_previous_goal
                     ),
+                    "memory": decision.memory,
+                    "next_goal": decision.next_goal,
+                }
+            )
+            # 推送当前目标，让前端显示正在做什么。
+            await self._emit_event(
+                {
+                    "type": "progress",
                     "memory": decision.memory,
                     "next_goal": decision.next_goal,
                 }
@@ -393,6 +443,14 @@ class Agent:
 
                 requires_observation = (
                     action.name in OBSERVATION_REQUIRED_ACTIONS
+                )
+                # 动作开始前推送，前端可以即时显示"正在点击/输入"。
+                await self._emit_event(
+                    {
+                        "type": "action",
+                        "name": action.name,
+                        "arguments": redact_value(action.arguments),
+                    }
                 )
                 await self._prepare_visual_action(
                     browser_session_id,
