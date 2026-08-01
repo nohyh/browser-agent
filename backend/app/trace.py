@@ -119,11 +119,7 @@ class TraceRecorder:
                 ),
                 "message_count": len(event.get("messages") or []),
                 "task_context": [
-                    {
-                        key: item.get(key)
-                        for key in ("name", "status")
-                        if item.get(key) is not None
-                    }
+                    self._task_context_summary(item)
                     for item in (event.get("task_context") or [])
                 ],
             }
@@ -161,6 +157,9 @@ class TraceRecorder:
             effect = {
                 "dispatched": False,
                 "page_changed": None,
+                "url_changed": None,
+                "snapshot_changed": None,
+                "stabilized": False,
             }
 
         if error is None:
@@ -210,6 +209,16 @@ class TraceRecorder:
             "sha256": digest,
             "characters": len(snapshot),
         }
+        payload = safe_value
+        if isinstance(safe_value, dict) and isinstance(
+            safe_value.get("data"),
+            dict,
+        ):
+            payload = safe_value["data"]
+        if isinstance(payload, dict):
+            for key in ("url", "origin", "title", "lifecycle"):
+                if payload.get(key) is not None:
+                    summary[key] = self._compact_trace_value(payload[key])
         if include_preview:
             if digest == self._last_snapshot_hash:
                 summary["duplicate"] = True
@@ -240,6 +249,36 @@ class TraceRecorder:
             index += repeated
         preview = "\n".join(collapsed)
         return preview[:2_000]
+
+    @classmethod
+    def _task_context_summary(cls, item: Any) -> Any:
+        """保留模型决策所需字段，同时避免日志复制整棵页面树。"""
+        safe_item = redact_value(item)
+        if not isinstance(safe_item, dict):
+            return cls._compact_trace_value(safe_item)
+        summary = {
+            key: safe_item.get(key)
+            for key in (
+                "type",
+                "name",
+                "arguments",
+                "status",
+                "data",
+                "error",
+                "effect",
+                "evaluation_previous_goal",
+                "memory",
+                "next_goal",
+            )
+            if safe_item.get(key) is not None
+        }
+        if isinstance(summary.get("data"), dict):
+            summary["data"] = {
+                key: value
+                for key, value in summary["data"].items()
+                if key not in {"snapshot", "refs"}
+            }
+        return cls._compact_trace_value(summary)
 
     @classmethod
     def _compact_trace_value(cls, value: Any) -> Any:

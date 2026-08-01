@@ -1,5 +1,41 @@
 # agent-browser MCP API 完整参考
 
+## Browser Agent HTTP companion
+
+侧边栏默认请求 `http://127.0.0.1:8000`，由后端负责启动或连接浏览器，再执行 Agent loop。
+
+启动会话：
+
+```http
+POST /browser/session/start
+Content-Type: application/json
+
+{
+  "browser_session_id": "browser-agent-demo",
+  "mode": "isolated"
+}
+```
+
+连接当前浏览器时使用 `mode: "existing"` 并提供 `cdp_url`，例如 `"9222"`。启动成功后再调用：
+
+```http
+POST /agent/run
+Content-Type: application/json
+
+{
+  "message": "读取当前页面标题",
+  "conversation_id": "conversation-demo",
+  "browser_session_id": "browser-agent-demo",
+  "llm_config": {
+    "api_url": "https://api.openai.com/v1",
+    "api_key": "sk-...",
+    "model": "gpt-5"
+  }
+}
+```
+
+`llm_config` 可省略，省略时使用后端进程环境变量。侧边栏会先调用 session start，再调用 agent run；两次请求使用同一个浏览器会话标识。`DELETE /browser/sessions/{browser_session_id}` 可关闭指定会话。
+
 本文档对应本地源码和实际运行的 `agent-browser 0.33.0`。范围是 `agent-browser mcp --tools all` 暴露的完整 MCP 接口，共 152 个类型化工具。
 
 ## 1. 能力边界

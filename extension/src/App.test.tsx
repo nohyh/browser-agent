@@ -33,6 +33,15 @@ function mockChromeStorage(initialValue?: {
   return { get, set };
 }
 
+function jsonResponse(body: unknown, status = 200) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: vi.fn(async () => body),
+    text: vi.fn(async () => JSON.stringify(body)),
+  } as unknown as Response;
+}
+
 describe('Browser Agent 侧边栏', () => {
   it('展示精简聊天首页与新 Logo', () => {
     render(<App />);
@@ -121,5 +130,111 @@ describe('Browser Agent 侧边栏', () => {
 
     expect(screen.queryByRole('button', { name: '工具' })).not.toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: '工具箱' })).not.toBeInTheDocument();
+  });
+
+  it('选择独立 profile 后先启动浏览器再执行真实任务', async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          browser_session_id: 'browser-agent-test',
+          mode: 'isolated',
+          ready: true,
+          url: 'about:blank',
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          success: true,
+          answer: '任务已经完成',
+          token_usage: null,
+        }),
+      );
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+
+    expect(screen.getByRole('radio', { name: '独立 profile' })).toBeChecked();
+    await user.type(screen.getByLabelText('任务内容'), '打开当前页面的登录按钮');
+    await user.click(screen.getByRole('button', { name: '发送任务' }));
+
+    expect(await screen.findByText('任务已经完成')).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({
+      browser_session_id: expect.any(String),
+      mode: 'isolated',
+    });
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toMatchObject({
+      message: '打开当前页面的登录按钮',
+      conversation_id: expect.any(String),
+      browser_session_id: expect.any(String),
+    });
+  });
+
+  it('选择当前浏览器时使用显式 CDP 地址', async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          browser_session_id: 'browser-agent-test',
+          mode: 'existing',
+          ready: true,
+          url: 'https://example.com',
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          success: true,
+          answer: '已完成',
+          token_usage: null,
+        }),
+      );
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    await user.click(screen.getByRole('radio', { name: '当前浏览器' }));
+    const cdpInput = screen.getByLabelText('当前浏览器连接地址');
+    await user.clear(cdpInput);
+    await user.type(cdpInput, '9222');
+    await user.type(screen.getByLabelText('任务内容'), '读取当前页面标题');
+    await user.click(screen.getByRole('button', { name: '发送任务' }));
+
+    await screen.findByText('已完成');
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({
+      mode: 'existing',
+      cdp_url: '9222',
+    });
+  });
+
+  it('停止任务会中止正在进行的后端请求', async () => {
+    const user = userEvent.setup();
+    let resolveRun: ((response: Response) => void) | undefined;
+    const runResponse = new Promise<Response>((resolve) => {
+      resolveRun = resolve;
+    });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          browser_session_id: 'browser-agent-test',
+          mode: 'isolated',
+          ready: true,
+          url: 'about:blank',
+        }),
+      )
+      .mockReturnValueOnce(runResponse);
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    await user.type(screen.getByLabelText('任务内容'), '执行一个耗时任务');
+    await user.click(screen.getByRole('button', { name: '发送任务' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await user.click(screen.getByRole('button', { name: '停止任务' }));
+
+    expect(fetchMock.mock.calls[1][1].signal.aborted).toBe(true);
+    expect(screen.getByText('任务已停止')).toBeInTheDocument();
+    resolveRun?.(jsonResponse({ success: true, answer: 'late result' }));
   });
 });

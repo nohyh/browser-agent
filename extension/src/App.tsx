@@ -15,6 +15,7 @@ import './App.css';
 
 type View = 'chat' | 'settings';
 type MessageRole = 'user' | 'assistant';
+type BrowserMode = 'isolated' | 'existing';
 
 interface Message {
   id: string;
@@ -36,13 +37,36 @@ interface ModelConfig {
   model: string;
 }
 
+interface BackendConfig {
+  backendUrl: string;
+  cdpUrl: string;
+}
+
+interface BrowserSessionResult {
+  browser_session_id: string;
+  mode: BrowserMode;
+  ready: boolean;
+  url: string | null;
+}
+
+interface AgentResult {
+  success: boolean;
+  answer: string;
+  token_usage?: unknown;
+}
+
 type StorageStatus = 'loading' | 'idle' | 'saving' | 'saved' | 'error';
 
 const MODEL_CONFIG_STORAGE_KEY = 'modelConfig';
+const BACKEND_CONFIG_STORAGE_KEY = 'backendConfig';
 const DEFAULT_MODEL_CONFIG: ModelConfig = {
   apiUrl: 'https://api.openai.com/v1',
   apiKey: '',
   model: 'gpt-5',
+};
+const DEFAULT_BACKEND_CONFIG: BackendConfig = {
+  backendUrl: 'http://127.0.0.1:8000',
+  cdpUrl: '9222',
 };
 
 function isModelConfig(value: unknown): value is ModelConfig {
@@ -54,6 +78,69 @@ function isModelConfig(value: unknown): value is ModelConfig {
     typeof candidate.apiKey === 'string' &&
     typeof candidate.model === 'string'
   );
+}
+
+function isBackendConfig(value: unknown): value is BackendConfig {
+  if (!value || typeof value !== 'object') return false;
+
+  const candidate = value as Partial<BackendConfig>;
+  return (
+    typeof candidate.backendUrl === 'string' &&
+    typeof candidate.cdpUrl === 'string'
+  );
+}
+
+function normalizeBackendUrl(value: string) {
+  return value.trim().replace(/\/+$/, '') || DEFAULT_BACKEND_CONFIG.backendUrl;
+}
+
+function createId(prefix: string) {
+  const randomId =
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return `${prefix}-${randomId}`;
+}
+
+function isAbortError(error: unknown) {
+  return (
+    (error instanceof DOMException && error.name === 'AbortError') ||
+    (error instanceof Error && error.name === 'AbortError')
+  );
+}
+
+async function requestBackend<T>(
+  backendUrl: string,
+  path: string,
+  init: RequestInit,
+): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(`${normalizeBackendUrl(backendUrl)}${path}`, {
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(init.headers ?? {}),
+      },
+    });
+  } catch (error) {
+    if (isAbortError(error)) throw error;
+    throw new Error('无法连接后端，请确认 Browser Agent 服务已启动。');
+  }
+
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const detail =
+      payload && typeof payload === 'object' && 'detail' in payload
+        ? (payload as { detail?: unknown }).detail
+        : null;
+    const message =
+      typeof detail === 'string'
+        ? detail
+        : `后端请求失败（${response.status}）`;
+    throw new Error(message);
+  }
+  return payload as T;
 }
 
 function getLocalStorageArea() {
@@ -255,7 +342,15 @@ function EmptyChat() {
   );
 }
 
-function MessageThread({ messages, running }: { messages: Message[]; running: boolean }) {
+function MessageThread({
+  messages,
+  running,
+  runningLabel,
+}: {
+  messages: Message[];
+  running: boolean;
+  runningLabel: string;
+}) {
   return (
     <div className="message-thread">
       {messages.map((message) => (
@@ -278,7 +373,7 @@ function MessageThread({ messages, running }: { messages: Message[]; running: bo
           </span>
           <div className="message-body">
             <span className="message-author">Browser Agent</span>
-            <p className="running-copy">正在处理当前页面...</p>
+            <p className="running-copy">{runningLabel}</p>
           </div>
         </div>
       )}
@@ -286,15 +381,90 @@ function MessageThread({ messages, running }: { messages: Message[]; running: bo
   );
 }
 
+function BrowserModePicker({
+  mode,
+  cdpUrl,
+  disabled,
+  onModeChange,
+  onCdpUrlChange,
+}: {
+  mode: BrowserMode;
+  cdpUrl: string;
+  disabled: boolean;
+  onModeChange: (mode: BrowserMode) => void;
+  onCdpUrlChange: (value: string) => void;
+}) {
+  return (
+    <section className="browser-mode" aria-labelledby="browser-mode-title">
+      <div className="browser-mode-heading">
+        <span id="browser-mode-title">浏览器</span>
+        <small>{mode === 'isolated' ? '使用独立 profile' : '接管当前浏览器'}</small>
+      </div>
+      <div className="mode-options" role="radiogroup" aria-label="浏览器模式">
+        <label className={`mode-option${mode === 'isolated' ? ' is-selected' : ''}`}>
+          <input
+            type="radio"
+            name="browser-mode"
+            value="isolated"
+            aria-label="独立 profile"
+            checked={mode === 'isolated'}
+            disabled={disabled}
+            onChange={() => onModeChange('isolated')}
+          />
+          <span>
+            <strong>独立 profile</strong>
+            <small>新开一个干净浏览器</small>
+          </span>
+        </label>
+        <label className={`mode-option${mode === 'existing' ? ' is-selected' : ''}`}>
+          <input
+            type="radio"
+            name="browser-mode"
+            value="existing"
+            aria-label="当前浏览器"
+            checked={mode === 'existing'}
+            disabled={disabled}
+            onChange={() => onModeChange('existing')}
+          />
+          <span>
+            <strong>当前浏览器</strong>
+            <small>保留登录态和已打开页面</small>
+          </span>
+        </label>
+      </div>
+      {mode === 'existing' && (
+        <label className="cdp-field">
+          <span>连接地址</span>
+          <input
+            aria-label="当前浏览器连接地址"
+            value={cdpUrl}
+            disabled={disabled}
+            onChange={(event) => onCdpUrlChange(event.target.value)}
+            placeholder="9222 或 http://127.0.0.1:9222"
+          />
+        </label>
+      )}
+    </section>
+  );
+}
+
 function Composer({
   value,
   running,
+  browserMode,
+  cdpUrl,
+  onBrowserModeChange,
+  onCdpUrlChange,
   onChange,
   onSubmit,
   onStop,
 }: {
   value: string;
   running: boolean;
+  browserMode: BrowserMode;
+  cdpUrl: string;
+  onBrowserModeChange: (mode: BrowserMode) => void;
+  onCdpUrlChange: (value: string) => void;
   onChange: (value: string) => void;
   onSubmit: () => void;
   onStop: () => void;
@@ -306,6 +476,13 @@ function Composer({
 
   return (
     <div className="composer-wrap">
+      <BrowserModePicker
+        mode={browserMode}
+        cdpUrl={cdpUrl}
+        disabled={running}
+        onModeChange={onBrowserModeChange}
+        onCdpUrlChange={onCdpUrlChange}
+      />
       <form className="composer" onSubmit={handleSubmit}>
         <textarea
           aria-label="任务内容"
@@ -326,7 +503,11 @@ function Composer({
             <Paperclip size={18} />
           </IconButton>
           {running ? (
-            <button className="stop-button" type="button" onClick={onStop}>
+            <button
+              className="stop-button"
+              type="button"
+              aria-label="停止任务"
+              onClick={onStop}>
               停止
             </button>
           ) : (
@@ -344,7 +525,12 @@ function ChatView({
   activeSession,
   messages,
   running,
+  runningLabel,
   draft,
+  browserMode,
+  cdpUrl,
+  onBrowserModeChange,
+  onCdpUrlChange,
   onDraftChange,
   onSubmit,
   onStop,
@@ -352,7 +538,12 @@ function ChatView({
   activeSession: Session | null;
   messages: Message[];
   running: boolean;
+  runningLabel: string;
   draft: string;
+  browserMode: BrowserMode;
+  cdpUrl: string;
+  onBrowserModeChange: (mode: BrowserMode) => void;
+  onCdpUrlChange: (value: string) => void;
   onDraftChange: (value: string) => void;
   onSubmit: () => void;
   onStop: () => void;
@@ -365,11 +556,19 @@ function ChatView({
         </div>
       )}
       <div className="chat-scroll">
-        {messages.length || running ? <MessageThread messages={messages} running={running} /> : <EmptyChat />}
+        {messages.length || running ? (
+          <MessageThread messages={messages} running={running} runningLabel={runningLabel} />
+        ) : (
+          <EmptyChat />
+        )}
       </div>
       <Composer
         value={draft}
         running={running}
+        browserMode={browserMode}
+        cdpUrl={cdpUrl}
+        onBrowserModeChange={onBrowserModeChange}
+        onCdpUrlChange={onCdpUrlChange}
         onChange={onDraftChange}
         onSubmit={onSubmit}
         onStop={onStop}
@@ -398,58 +597,22 @@ function Field({
   );
 }
 
-function SettingsView() {
+function SettingsView({
+  modelConfig,
+  backendConfig,
+  storageStatus,
+  onModelConfigChange,
+  onBackendConfigChange,
+  onSave,
+}: {
+  modelConfig: ModelConfig;
+  backendConfig: BackendConfig;
+  storageStatus: StorageStatus;
+  onModelConfigChange: (key: keyof ModelConfig, value: string) => void;
+  onBackendConfigChange: (key: keyof BackendConfig, value: string) => void;
+  onSave: () => void;
+}) {
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
-  const [config, setConfig] = useState<ModelConfig>(DEFAULT_MODEL_CONFIG);
-  const [storageStatus, setStorageStatus] = useState<StorageStatus>('loading');
-
-  useEffect(() => {
-    let mounted = true;
-
-    const restoreConfig = async () => {
-      const storage = getLocalStorageArea();
-      if (!storage) {
-        if (mounted) setStorageStatus('idle');
-        return;
-      }
-
-      try {
-        const stored = await storage.get(MODEL_CONFIG_STORAGE_KEY);
-        if (mounted && isModelConfig(stored[MODEL_CONFIG_STORAGE_KEY])) {
-          setConfig(stored[MODEL_CONFIG_STORAGE_KEY]);
-        }
-        if (mounted) setStorageStatus('idle');
-      } catch {
-        if (mounted) setStorageStatus('error');
-      }
-    };
-
-    void restoreConfig();
-    return () => {
-      mounted = false;
-    };
-  }, []);
-
-  const updateConfig = (key: keyof ModelConfig, value: string) => {
-    setConfig((current) => ({ ...current, [key]: value }));
-    if (storageStatus === 'saved' || storageStatus === 'error') setStorageStatus('idle');
-  };
-
-  const saveConfig = async () => {
-    const storage = getLocalStorageArea();
-    if (!storage) {
-      setStorageStatus('error');
-      return;
-    }
-
-    setStorageStatus('saving');
-    try {
-      await storage.set({ [MODEL_CONFIG_STORAGE_KEY]: config });
-      setStorageStatus('saved');
-    } catch {
-      setStorageStatus('error');
-    }
-  };
 
   const statusText = {
     loading: '正在读取本地配置',
@@ -477,9 +640,9 @@ function SettingsView() {
           <input
             aria-label="API 地址"
             inputMode="url"
-            value={config.apiUrl}
+            value={modelConfig.apiUrl}
             disabled={storageStatus === 'loading'}
-            onChange={(event) => updateConfig('apiUrl', event.target.value)}
+            onChange={(event) => onModelConfigChange('apiUrl', event.target.value)}
           />
         </Field>
         <Field label="API Key">
@@ -488,9 +651,9 @@ function SettingsView() {
               aria-label="API Key"
               type={apiKeyVisible ? 'text' : 'password'}
               autoComplete="off"
-              value={config.apiKey}
+              value={modelConfig.apiKey}
               disabled={storageStatus === 'loading'}
-              onChange={(event) => updateConfig('apiKey', event.target.value)}
+              onChange={(event) => onModelConfigChange('apiKey', event.target.value)}
             />
             <button
               type="button"
@@ -503,9 +666,26 @@ function SettingsView() {
         <Field label="模型" hint="填写 OpenAI 模型名称">
           <input
             aria-label="模型"
-            value={config.model}
+            value={modelConfig.model}
             disabled={storageStatus === 'loading'}
-            onChange={(event) => updateConfig('model', event.target.value)}
+            onChange={(event) => onModelConfigChange('model', event.target.value)}
+          />
+        </Field>
+        <Field label="后端地址" hint="本地服务默认是 http://127.0.0.1:8000">
+          <input
+            aria-label="后端地址"
+            inputMode="url"
+            value={backendConfig.backendUrl}
+            disabled={storageStatus === 'loading'}
+            onChange={(event) => onBackendConfigChange('backendUrl', event.target.value)}
+          />
+        </Field>
+        <Field label="当前浏览器连接地址" hint="只有选择当前浏览器时需要，例如 9222">
+          <input
+            aria-label="设置中的当前浏览器连接地址"
+            value={backendConfig.cdpUrl}
+            disabled={storageStatus === 'loading'}
+            onChange={(event) => onBackendConfigChange('cdpUrl', event.target.value)}
           />
         </Field>
       </section>
@@ -516,7 +696,7 @@ function SettingsView() {
         <button
           type="button"
           disabled={storageStatus === 'loading' || storageStatus === 'saving'}
-          onClick={() => void saveConfig()}>
+          onClick={onSave}>
           {storageStatus === 'saved' && <Check size={17} weight="bold" />}
           {storageStatus === 'saving' ? '保存中' : storageStatus === 'saved' ? '已保存' : '保存配置'}
         </button>
@@ -532,30 +712,100 @@ export default function App() {
   const [draft, setDraft] = useState('');
   const [sessionsOpen, setSessionsOpen] = useState(false);
   const [running, setRunning] = useState(false);
-  const completionTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [runningLabel, setRunningLabel] = useState('正在准备浏览器...');
+  const [browserMode, setBrowserMode] = useState<BrowserMode>('isolated');
+  const [modelConfig, setModelConfig] = useState<ModelConfig>(DEFAULT_MODEL_CONFIG);
+  const [backendConfig, setBackendConfig] = useState<BackendConfig>(DEFAULT_BACKEND_CONFIG);
+  const [storageStatus, setStorageStatus] = useState<StorageStatus>('loading');
+  const [conversationId, setConversationId] = useState(() => createId('conversation'));
+  const [browserSessionId, setBrowserSessionId] = useState(() => createId('browser-agent'));
+  const abortController = useRef<AbortController | null>(null);
+  const stopRequested = useRef(false);
 
-  useEffect(
-    () => () => {
-      if (completionTimer.current) clearTimeout(completionTimer.current);
-    },
-    [],
-  );
+  useEffect(() => {
+    let mounted = true;
+    const restoreConfig = async () => {
+      const storage = getLocalStorageArea();
+      if (!storage) {
+        if (mounted) setStorageStatus('idle');
+        return;
+      }
+
+      try {
+        const storedModel = await storage.get(MODEL_CONFIG_STORAGE_KEY);
+        const storedBackend = await storage.get(BACKEND_CONFIG_STORAGE_KEY);
+        if (mounted && isModelConfig(storedModel[MODEL_CONFIG_STORAGE_KEY])) {
+          setModelConfig(storedModel[MODEL_CONFIG_STORAGE_KEY]);
+        }
+        if (mounted && isBackendConfig(storedBackend[BACKEND_CONFIG_STORAGE_KEY])) {
+          setBackendConfig(storedBackend[BACKEND_CONFIG_STORAGE_KEY]);
+        }
+        if (mounted) setStorageStatus('idle');
+      } catch {
+        if (mounted) setStorageStatus('error');
+      }
+    };
+
+    void restoreConfig();
+    return () => {
+      mounted = false;
+      abortController.current?.abort();
+    };
+  }, []);
+
+  const updateModelConfig = (key: keyof ModelConfig, value: string) => {
+    setModelConfig((current) => ({ ...current, [key]: value }));
+    if (storageStatus === 'saved' || storageStatus === 'error') setStorageStatus('idle');
+  };
+
+  const updateBackendConfig = (key: keyof BackendConfig, value: string) => {
+    setBackendConfig((current) => ({ ...current, [key]: value }));
+    if (storageStatus === 'saved' || storageStatus === 'error') setStorageStatus('idle');
+  };
+
+  const saveConfig = async () => {
+    const storage = getLocalStorageArea();
+    if (!storage) {
+      setStorageStatus('error');
+      return;
+    }
+
+    setStorageStatus('saving');
+    try {
+      await storage.set({ [MODEL_CONFIG_STORAGE_KEY]: modelConfig });
+      await storage.set({ [BACKEND_CONFIG_STORAGE_KEY]: backendConfig });
+      setStorageStatus('saved');
+    } catch {
+      setStorageStatus('error');
+    }
+  };
+
+  const resetBrowserSession = () => {
+    setBrowserSessionId(createId('browser-agent'));
+  };
 
   const startNewChat = () => {
-    if (completionTimer.current) clearTimeout(completionTimer.current);
+    stopRequested.current = true;
+    abortController.current?.abort();
     setActiveView('chat');
     setActiveSession(null);
     setMessages([]);
     setDraft('');
     setRunning(false);
+    setRunningLabel('正在准备浏览器...');
+    setConversationId(createId('conversation'));
+    resetBrowserSession();
     setSessionsOpen(false);
   };
 
   const selectSession = (session: Session) => {
-    if (completionTimer.current) clearTimeout(completionTimer.current);
+    stopRequested.current = true;
+    abortController.current?.abort();
     setActiveSession(session);
     setMessages(session.messages);
     setRunning(false);
+    setConversationId(session.id);
+    resetBrowserSession();
     setActiveView('chat');
     setSessionsOpen(false);
   };
@@ -564,33 +814,104 @@ export default function App() {
     const content = draft.trim();
     if (!content || running) return;
 
-    setMessages((current) => [
-      ...current,
-      {
-        id: `user-${Date.now()}`,
-        role: 'user',
-        content,
-      },
-    ]);
+    const userMessage: Message = {
+      id: `user-${Date.now()}`,
+      role: 'user',
+      content,
+    };
+
+    setMessages((current) => [...current, userMessage]);
     setDraft('');
     setRunning(true);
+    stopRequested.current = false;
+    const controller = new AbortController();
+    abortController.current = controller;
+    void (async () => {
+      try {
+        setRunningLabel('正在连接浏览器...');
+        const session = await requestBackend<BrowserSessionResult>(
+          backendConfig.backendUrl,
+          '/browser/session/start',
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              browser_session_id: browserSessionId,
+              mode: browserMode,
+              ...(browserMode === 'existing' ? { cdp_url: backendConfig.cdpUrl.trim() } : {}),
+            }),
+            signal: controller.signal,
+          },
+        );
+        if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+        if (!session.ready) throw new Error('浏览器会话没有准备好，请重试。');
+        setRunningLabel('Agent 正在操作当前页面...');
 
-    // 后端尚未接线，暂时用短反馈展示完整聊天状态。
-    completionTimer.current = setTimeout(() => {
-      setMessages((current) => [
-        ...current,
-        {
+        const result = await requestBackend<AgentResult>(
+          backendConfig.backendUrl,
+          '/agent/run',
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              message: content,
+              conversation_id: conversationId,
+              browser_session_id: browserSessionId,
+              llm_config: {
+                api_url: modelConfig.apiUrl,
+                api_key: modelConfig.apiKey,
+                model: modelConfig.model,
+              },
+            }),
+            signal: controller.signal,
+          },
+        );
+        if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+        const answer = result.answer?.trim() || '任务已完成。';
+        const assistantMessage: Message = {
           id: `assistant-${Date.now()}`,
           role: 'assistant',
-          content: '已收到任务。接入后端后，这里会显示真实的执行结果。',
-        },
-      ]);
-      setRunning(false);
-    }, 900);
+          content: answer,
+        };
+        setMessages((current) => [...current, assistantMessage]);
+        setActiveSession((current) => ({
+          id: conversationId,
+          title: current?.title || content.slice(0, 32),
+          preview: answer,
+          updatedAt: '刚刚',
+          messages: [...(current?.messages || [userMessage]), assistantMessage],
+        }));
+      } catch (error) {
+        if (isAbortError(error) && stopRequested.current) return;
+        const message = isAbortError(error)
+          ? '任务已停止'
+          : `执行失败：${error instanceof Error ? error.message : '未知错误'}`;
+        setMessages((current) => [
+          ...current,
+          {
+            id: `assistant-${Date.now()}`,
+            role: 'assistant',
+            content: message,
+          },
+        ]);
+      } finally {
+        if (abortController.current === controller) abortController.current = null;
+        setRunning(false);
+        setRunningLabel('正在准备浏览器...');
+      }
+    })();
   };
 
   const stopTask = () => {
-    if (completionTimer.current) clearTimeout(completionTimer.current);
+    if (!running) return;
+    stopRequested.current = true;
+    abortController.current?.abort();
+    setMessages((current) => [
+      ...current,
+      {
+        id: `assistant-${Date.now()}`,
+        role: 'assistant',
+        content: '任务已停止',
+      },
+    ]);
     setRunning(false);
   };
 
@@ -609,13 +930,25 @@ export default function App() {
             activeSession={activeSession}
             messages={messages}
             running={running}
+            runningLabel={runningLabel}
             draft={draft}
+            browserMode={browserMode}
+            cdpUrl={backendConfig.cdpUrl}
+            onBrowserModeChange={setBrowserMode}
+            onCdpUrlChange={(value) => updateBackendConfig('cdpUrl', value)}
             onDraftChange={setDraft}
             onSubmit={submitTask}
             onStop={stopTask}
           />
         ) : (
-          <SettingsView />
+          <SettingsView
+            modelConfig={modelConfig}
+            backendConfig={backendConfig}
+            storageStatus={storageStatus}
+            onModelConfigChange={updateModelConfig}
+            onBackendConfigChange={updateBackendConfig}
+            onSave={() => void saveConfig()}
+          />
         )}
       </div>
       <SessionDrawer

@@ -344,6 +344,116 @@ textarea:disabled {
   background: var(--canvas);
 }
 
+.browser-mode {
+  margin: 0 2px 9px;
+}
+
+.browser-mode-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.browser-mode-heading > span {
+  color: var(--body);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.browser-mode-heading small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mode-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.mode-option {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 8px 9px;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  color: var(--body);
+  cursor: pointer;
+}
+
+.mode-option.is-selected {
+  border-color: var(--coral);
+  background: var(--coral-soft);
+}
+
+.mode-option input {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  margin: 1px 0 0;
+  accent-color: var(--coral-strong);
+}
+
+.mode-option > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.mode-option strong {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mode-option small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cdp-field {
+  display: grid;
+  gap: 5px;
+  margin-top: 7px;
+}
+
+.cdp-field > span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.cdp-field input {
+  width: 100%;
+  height: 32px;
+  padding: 0 9px;
+  border: 1px solid var(--hairline-strong);
+  border-radius: 7px;
+  outline: 0;
+  background: var(--surface-soft);
+  color: var(--ink);
+  font-size: 11px;
+}
+
+.cdp-field input:focus {
+  border-color: var(--coral);
+  box-shadow: 0 0 0 3px rgb(204 120 92 / 0.14);
+}
+
 .composer {
   overflow: hidden;
   border: 1px solid var(--hairline-strong);

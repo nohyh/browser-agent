@@ -1,5 +1,6 @@
 """浏览器 Agent 的最小执行循环与结构化输出模型。"""
 
+import asyncio
 import hashlib
 import json
 import re
@@ -84,6 +85,7 @@ VISUAL_CLICK_ACTIONS = {
     "agent_browser_uncheck",
     "agent_browser_select",
 }
+PAGE_STABILITY_RETRY_DELAY_SECONDS = 0.12
 VISUAL_OVERLAY_SCRIPT = r"""
 (() => {
   const layerId = 'browser-agent-visual-layer';
@@ -260,19 +262,63 @@ class Agent:
         observation_required = True
         pending_outcome: dict[str, Any] | None = None
         pending_fingerprint: tuple[str | None, str] | None = None
+        observation_stable = True
         token_usage = await self._maybe_compact_conversation()
 
         for _ in range(self.max_steps):
             try:
                 if observation_required:
                     observation = await self.observe(browser_session_id)
-                    self._record_page_visit(observation)
                     new_fingerprint = self._page_fingerprint(observation)
+                    if pending_outcome is not None:
+                        observation_stable = not self._observation_is_empty(
+                            observation
+                        )
+                        if self._needs_stability_retry(
+                            before=pending_fingerprint,
+                            after=new_fingerprint,
+                            observation=observation,
+                        ):
+                            await asyncio.sleep(
+                                PAGE_STABILITY_RETRY_DELAY_SECONDS
+                            )
+                            retry_observation = await self.observe(
+                                browser_session_id
+                            )
+                            retry_fingerprint = self._page_fingerprint(
+                                retry_observation
+                            )
+                            self._record(
+                                {
+                                    "type": "observation_retry",
+                                    "reason": "navigation_snapshot_empty",
+                                    "before": pending_fingerprint,
+                                    "first": new_fingerprint,
+                                    "retry": retry_fingerprint,
+                                }
+                            )
+                            observation = retry_observation
+                            new_fingerprint = retry_fingerprint
+                            observation_stable = not self._observation_is_empty(
+                                observation
+                            )
+                    else:
+                        observation_stable = not self._observation_is_empty(
+                            observation
+                        )
+                    self._record_page_visit(observation)
                     if pending_outcome is not None:
                         self._apply_page_effect(
                             pending_outcome,
                             before=pending_fingerprint,
                             after=new_fingerprint,
+                            stabilized=observation_stable,
+                        )
+                        self._record(
+                            {
+                                **pending_outcome,
+                                "finalized": True,
+                            }
                         )
                     observation_fingerprint = new_fingerprint
                     observation_required = False
@@ -329,6 +375,13 @@ class Agent:
                 )
 
             if decision.status in {"completed", "blocked"}:
+                if decision.status == "completed" and not observation_stable:
+                    return self._finish(
+                        success=False,
+                        answer="页面仍在加载，暂未确认最终状态。",
+                        token_usage=token_usage,
+                        status="blocked",
+                    )
                 return self._finish(
                     success=decision.status == "completed",
                     answer=decision.final_answer,
@@ -785,6 +838,9 @@ class Agent:
                 "effect": {
                     "dispatched": uncertain,
                     "page_changed": None,
+                    "url_changed": None,
+                    "snapshot_changed": None,
+                    "stabilized": False,
                 },
             }
 
@@ -817,6 +873,9 @@ class Agent:
             "effect": {
                 "dispatched": status == "succeeded",
                 "page_changed": None,
+                "url_changed": None,
+                "snapshot_changed": None,
+                "stabilized": False,
             },
         }
 
@@ -847,10 +906,35 @@ class Agent:
         return url, hashlib.sha256(snapshot.encode("utf-8")).hexdigest()
 
     @staticmethod
+    def _observation_is_empty(observation: Any) -> bool:
+        """识别跳转瞬间只有空交互树的中间状态。"""
+        snapshot = extract_snapshot(observation)
+        if snapshot is None:
+            return False
+        return not snapshot.strip() or snapshot.strip().lower() in {
+            "(no interactive elements)",
+            "no interactive elements",
+        }
+
+    @classmethod
+    def _needs_stability_retry(
+        cls,
+        before: tuple[str | None, str] | None,
+        after: tuple[str | None, str],
+        observation: Any,
+    ) -> bool:
+        return (
+            before is not None
+            and before[0] != after[0]
+            and cls._observation_is_empty(observation)
+        )
+
+    @staticmethod
     def _apply_page_effect(
         outcome: dict[str, Any],
         before: tuple[str | None, str] | None,
         after: tuple[str | None, str],
+        stabilized: bool = True,
     ) -> None:
         if before is None:
             return
@@ -862,6 +946,7 @@ class Agent:
             "page_changed": page_changed,
             "url_changed": url_changed,
             "snapshot_changed": snapshot_changed,
+            "stabilized": stabilized,
         }
         if page_changed and outcome["status"] == "uncertain":
             outcome["status"] = "succeeded"

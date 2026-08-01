@@ -5,6 +5,14 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 
+class LLMConfig(BaseModel):
+    """由侧边栏传入的模型连接配置。"""
+
+    api_url: str = Field(min_length=1)
+    api_key: str = ""
+    model: str = Field(min_length=1)
+
+
 class AgentAction(BaseModel):
     """LLM 选择的一次浏览器工具调用。"""
 

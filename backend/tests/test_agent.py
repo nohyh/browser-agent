@@ -1129,6 +1129,110 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(openai_client.responses.calls), 2)
 
+    async def test_navigation_retries_an_empty_snapshot_before_next_decision(self):
+        browser = FakeBrowser(
+            snapshot_values=[
+                {
+                    "data": {
+                        "snapshot": "HOME",
+                        "url": "https://before.test",
+                    }
+                },
+                {
+                    "data": {
+                        "snapshot": "(no interactive elements)",
+                        "url": "https://after.test",
+                    }
+                },
+                {
+                    "data": {
+                        "snapshot": "READY",
+                        "url": "https://after.test",
+                    }
+                },
+            ]
+        )
+        openai_client = FakeOpenAIClient(
+            [
+                continue_decision(
+                    [
+                        AgentAction(
+                            name="agent_browser_open",
+                            arguments={"url": "https://after.test"},
+                        )
+                    ]
+                ),
+                completed_decision("页面已稳定"),
+            ]
+        )
+        agent = Agent(
+            task="打开 after.test",
+            browser=browser,
+            llm=AgentLLM(openai_client, model="test-model"),
+        )
+
+        result = await agent.run("browser-session-1")
+
+        self.assertTrue(result.success)
+        self.assertEqual(browser.snapshot_count, 3)
+        self.assertIn("READY", str(openai_client.responses.calls[1]["input"]))
+        navigation_result = [
+            event
+            for event in agent.trace
+            if event.get("type") == "tool_result"
+            and event.get("name") == "agent_browser_open"
+        ][-1]
+        self.assertTrue(navigation_result["effect"]["stabilized"])
+
+    def test_trace_keeps_page_facts_and_latest_progress_summary(self):
+        agent = Agent(
+            task="inspect",
+            browser=FakeBrowser(),
+            llm=AgentLLM(FakeOpenAIClient([]), model="test-model"),
+        )
+        agent._record(
+            {
+                "type": "llm_call",
+                "browser_session_id": "browser-session-1",
+                "observation": {
+                    "data": {
+                        "url": "https://example.test",
+                        "title": "Example",
+                        "snapshot": "VISIBLE",
+                    }
+                },
+                "messages": [],
+                "task_context": [
+                    {
+                        "type": "agent_progress",
+                        "evaluation_previous_goal": "已打开页面",
+                        "memory": "页面标题已确认",
+                        "next_goal": "读取内容",
+                    },
+                    {
+                        "type": "tool_result",
+                        "name": "agent_browser_click",
+                        "status": "succeeded",
+                        "data": {"text": "saved"},
+                        "effect": {"page_changed": True},
+                    },
+                ],
+            }
+        )
+
+        event = agent.trace[-1]
+
+        self.assertEqual(event["observation"]["url"], "https://example.test")
+        self.assertEqual(event["observation"]["title"], "Example")
+        self.assertEqual(
+            event["task_context"][0]["memory"],
+            "页面标题已确认",
+        )
+        self.assertEqual(
+            event["task_context"][1]["data"]["text"],
+            "saved",
+        )
+
     async def test_snapshot_ref_selector_is_normalized_before_tool_call(self):
         browser = FakeBrowser(snapshot_values=["BEFORE", "AFTER"])
         openai_client = FakeOpenAIClient(
@@ -1792,6 +1896,78 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AgentApiTests(unittest.IsolatedAsyncioTestCase):
+    def test_agent_request_accepts_sidepanel_llm_config(self):
+        import main
+
+        payload = main.AgentRunRequest(
+            message="读取页面",
+            conversation_id="conversation-1",
+            browser_session_id="browser-session-1",
+            llm_config={
+                "api_url": "https://gateway.example.com/v1",
+                "api_key": "sidepanel-key",
+                "model": "gpt-5-mini",
+            },
+        )
+
+        self.assertEqual(payload.llm_config.model, "gpt-5-mini")
+
+    async def test_agent_run_uses_sidepanel_llm_config(self):
+        import main
+
+        browser = FakeBrowser()
+        browser.ready_sessions.add("browser-session-1")
+        configured_client = FakeOpenAIClient(
+            [completed_decision("configured model finished")]
+        )
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    agents={},
+                    agent_llm=AgentLLM(
+                        FakeOpenAIClient([]),
+                        model="environment-model",
+                    ),
+                )
+            )
+        )
+
+        with (
+            TemporaryDirectory() as temp_dir,
+            patch.object(main, "AsyncOpenAI", return_value=configured_client) as factory,
+            patch.object(
+                main,
+                "CONVERSATION_TRACE_DIR",
+                Path(temp_dir),
+                create=True,
+            ),
+        ):
+            result = await main.run_agent(
+                main.AgentRunRequest(
+                    message="读取页面",
+                    conversation_id="conversation-configured",
+                    browser_session_id="browser-session-1",
+                    llm_config={
+                        "api_url": "https://gateway.example.com/v1",
+                        "api_key": "sidepanel-key",
+                        "model": "gpt-5-mini",
+                    },
+                ),
+                request,
+                browser,
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.answer, "configured model finished")
+        self.assertEqual(
+            request.app.state.agents["conversation-configured"].llm.model,
+            "gpt-5-mini",
+        )
+        factory.assert_called_once_with(
+            api_key="sidepanel-key",
+            base_url="https://gateway.example.com/v1",
+        )
+
     async def test_session_must_be_started_before_running_agent(self):
         import main
 

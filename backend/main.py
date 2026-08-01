@@ -1,6 +1,8 @@
 """Browser Agent 后端入口和应用级依赖管理。"""
 
 import os
+import hashlib
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Literal
@@ -10,6 +12,7 @@ from fastapi import Depends
 from fastapi import FastAPI
 from fastapi import HTTPException
 from fastapi import Request
+from fastapi.middleware.cors import CORSMiddleware
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
 from openai import AsyncOpenAI
@@ -22,7 +25,7 @@ from app.mcp_client import (
     BrowserService,
     ManagedBrowserSession,
 )
-from app.models import AgentResult
+from app.models import AgentResult, LLMConfig
 
 
 CONVERSATION_TRACE_DIR = Path(__file__).parent / "logs" / "conversations"
@@ -42,6 +45,7 @@ class AgentRunRequest(BaseModel):
         min_length=1,
         pattern=BROWSER_SESSION_ID_PATTERN,
     )
+    llm_config: LLMConfig | None = None
 
 
 class BrowserSessionStartRequest(BaseModel):
@@ -81,18 +85,15 @@ async def lifespan(app: FastAPI):
     """在应用生命周期内复用 OpenAI 和 MCP 客户端。"""
     load_dotenv()
     api_key = os.getenv("OPENAI_API_KEY")
-    model = os.getenv("OPENAI_MODEL")
-    if not api_key or not model:
-        raise RuntimeError(
-            "OPENAI_API_KEY and OPENAI_MODEL must be set before startup"
-        )
-
+    model = os.getenv("OPENAI_MODEL") or "gpt-5"
     openai_client = AsyncOpenAI(
-        api_key=api_key,
+        api_key=api_key or "browser-agent-configured-from-sidepanel",
         base_url=os.getenv("OPENAI_BASE_URL") or None,
     )
     app.state.agent_llm = AgentLLM(openai_client, model=model)
     app.state.agents = {}
+    app.state.llm_clients = [openai_client]
+    app.state.llm_cache = {}
 
     params = get_server_parameters()
     try:
@@ -104,10 +105,52 @@ async def lifespan(app: FastAPI):
                 app.state.browser_service = browser
                 yield
     finally:
-        await openai_client.close()
+        for client in getattr(app.state, "llm_clients", [openai_client]):
+            await client.close()
 
 
 app = FastAPI(title="Browser Agent Backend", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def get_configured_llm(
+    request: Request,
+    config: LLMConfig | None,
+) -> AgentLLM:
+    """按侧边栏配置复用模型客户端，避免每个任务重新握手。"""
+    if config is None:
+        return request.app.state.agent_llm
+
+    cache_key = hashlib.sha256(
+        json.dumps(
+            config.model_dump(exclude={"api_key"}),
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+        + config.api_key.encode("utf-8")
+    ).hexdigest()
+    cache: dict[str, AgentLLM] = getattr(request.app.state, "llm_cache", {})
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    client = AsyncOpenAI(
+        api_key=config.api_key or "browser-agent-configured-from-sidepanel",
+        base_url=config.api_url,
+    )
+    configured = AgentLLM(client, model=config.model)
+    cache[cache_key] = configured
+    request.app.state.llm_cache = cache
+    clients = getattr(request.app.state, "llm_clients", [])
+    clients.append(client)
+    request.app.state.llm_clients = clients
+    return configured
 
 
 def get_browser_service(request: Request) -> BrowserService:
@@ -246,7 +289,7 @@ async def run_agent(
         agent = Agent(
             task=payload.message,
             browser=browser,
-            llm=request.app.state.agent_llm,
+            llm=get_configured_llm(request, payload.llm_config),
             trace_file=(
                 CONVERSATION_TRACE_DIR
                 / f"{payload.conversation_id}.md"
@@ -254,6 +297,7 @@ async def run_agent(
         )
         agents[payload.conversation_id] = agent
     else:
+        agent.llm = get_configured_llm(request, payload.llm_config)
         agent.add_user_message(payload.message)
 
     return await agent.run(payload.browser_session_id)
