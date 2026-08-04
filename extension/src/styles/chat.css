@@ -223,12 +223,18 @@
 .trajectory summary {
   display: inline-flex;
   align-items: center;
-  gap: 3px;
   width: fit-content;
   cursor: pointer;
   color: var(--muted);
   font-size: 10.5px;
   list-style: none;
+}
+
+.trajectory-summary-content {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  white-space: nowrap;
 }
 
 .trajectory summary::-webkit-details-marker {
@@ -437,4 +443,3 @@
 .stop-button:active {
   transform: translateY(1px);
 }
-

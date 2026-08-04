@@ -59,8 +59,14 @@ function TaskTrajectory({
   return (
     <details className="trajectory">
       <summary aria-label={completed ? undefined : '展开执行轨迹'}>
-        {completed && <span>操作了 {duration}s</span>}
-        <CaretRight size={11} weight="bold" aria-hidden="true" />
+        {completed ? (
+          <span className="trajectory-summary-content">
+            操作了 {duration}s
+            <CaretRight size={11} weight="bold" aria-hidden="true" />
+          </span>
+        ) : (
+          <CaretRight size={11} weight="bold" aria-hidden="true" />
+        )}
       </summary>
       <ol>
         {events.map((event, index) => (

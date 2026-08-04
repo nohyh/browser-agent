@@ -872,6 +872,7 @@ describe('Browser Agent 侧边栏', () => {
     expect(await screen.findByText('轨迹任务完成')).toBeInTheDocument();
     const trajectory = screen.getByText('操作了 1.2s');
     const details = trajectory.closest('details');
+    expect(details?.querySelector('.trajectory-summary-content')).toBeInTheDocument();
     expect(details).not.toHaveAttribute('open');
     expect(screen.queryByText('查看完整轨迹')).not.toBeInTheDocument();
     expect(screen.queryByText('隐藏')).not.toBeInTheDocument();
