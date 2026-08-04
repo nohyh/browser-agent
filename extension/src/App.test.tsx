@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import manifest from '../public/manifest.json';
@@ -127,10 +127,16 @@ describe('Browser Agent 侧边栏', () => {
   it('打开后分析当前页面并把点击的建议填入聊天框', async () => {
     const user = userEvent.setup();
     const chromeMock = mockCurrentPage({
-      modelConfig: {
-        apiUrl: 'https://gateway.example.com/v1',
-        apiKey: 'saved-key',
-        model: 'gpt-5-mini',
+      modelSettings: {
+        endpoints: [{
+          id: 'default',
+          name: 'OpenAI',
+          apiUrl: 'https://gateway.example.com/v1',
+          apiKey: 'saved-key',
+          availableModels: ['gpt-5-mini'],
+          enabledModels: ['gpt-5-mini'],
+        }],
+        defaultSelection: { endpointId: 'default', model: 'gpt-5-mini' },
       },
     });
     const fetchMock = mockHealthyBackend();
@@ -152,6 +158,7 @@ describe('Browser Agent 侧边栏', () => {
       locale: 'zh-CN',
       limit: 3,
     });
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/llm/configs'))).toBe(true);
 
     await user.click(suggestion);
 
@@ -288,6 +295,59 @@ describe('Browser Agent 侧边栏', () => {
       expected_url: 'https://example.com/guide',
     });
     expect(screen.getByText('当前浏览器')).toBeInTheDocument();
+  });
+
+  it('当前标签页导航后启动会话时使用最新 URL', async () => {
+    const user = userEvent.setup();
+    const chromeMock = mockCurrentPage();
+    const fetchMock = mockHealthyBackend();
+    render(<App />);
+
+    await createConversation(user, 'current');
+    chromeMock.query.mockResolvedValue([
+      { id: 23, url: 'https://example.com/after-navigation', title: '新页面' },
+    ]);
+    await user.type(screen.getByLabelText('任务内容'), '总结导航后的页面');
+    await user.click(screen.getByRole('button', { name: '发送任务' }));
+    await screen.findByText('任务已经完成。');
+
+    const startCall = fetchMock.mock.calls.find(([input]) =>
+      String(input).endsWith('/browser/session/start'),
+    );
+    expect(JSON.parse(String(startCall?.[1]?.body))).toMatchObject({
+      mode: 'current',
+      expected_url: 'https://example.com/after-navigation',
+    });
+  });
+
+  it('当前页面不是 HTTP 页面时仍可绑定整个 Chrome', async () => {
+    const user = userEvent.setup();
+    const storage = mockChromeStorage();
+    vi.stubGlobal('chrome', {
+      storage: { local: { get: storage.get, set: storage.set } },
+      tabs: {
+        query: vi.fn(async () => [
+          { id: 23, url: 'chrome://settings/', title: '设置' },
+        ]),
+      },
+      scripting: {
+        executeScript: vi.fn(async () => [{ result: 'chrome://settings/' }]),
+      },
+    });
+    const fetchMock = mockHealthyBackend();
+    render(<App />);
+
+    await createConversation(user, 'current');
+    await user.type(screen.getByLabelText('任务内容'), '查看其他已打开页面');
+    await user.click(screen.getByRole('button', { name: '发送任务' }));
+    await screen.findByText('任务已经完成。');
+
+    const startCall = fetchMock.mock.calls.find(([input]) =>
+      String(input).endsWith('/browser/session/start'),
+    );
+    const body = JSON.parse(String(startCall?.[1]?.body));
+    expect(body.mode).toBe('current');
+    expect(body).not.toHaveProperty('expected_url');
   });
 
   it('独立浏览器会话不会因为任务措辞自动改绑当前页面', async () => {
@@ -600,7 +660,146 @@ describe('Browser Agent 侧边栏', () => {
     });
   });
 
-  it('在对话中用耗时和箭头紧凑展示可折叠任务轨迹', async () => {
+  it('运行中只显示过程线和展开箭头，完成后才显示操作耗时', async () => {
+    const user = userEvent.setup();
+    const encoder = new TextEncoder();
+    let finishStream: (() => void) | undefined;
+    mockChromeStorage();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
+        if (url.includes('/browser/sessions/')) {
+          return jsonResponse({ detail: 'Browser session not found' }, 404);
+        }
+        if (url.endsWith('/browser/session/start')) {
+          return jsonResponse({ browser_session_id: 'browser-agent-test', mode: 'isolated', ready: true });
+        }
+        if (url.endsWith('/agent/run/stream')) {
+          const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(encoder.encode([
+                JSON.stringify({ type: 'run_started', run_id: 'run-ui-live' }),
+                JSON.stringify({
+                  type: 'trace',
+                  event: {
+                    kind: 'thinking',
+                    status: 'running',
+                    title: '正在分析页面并规划下一步',
+                    timestamp: '2026-08-03T14:00:00.000+08:00',
+                  },
+                }),
+                JSON.stringify({
+                  type: 'trace',
+                  event: {
+                    kind: 'action',
+                    status: 'running',
+                    title: '执行 agent_browser_click',
+                    timestamp: '2026-08-03T14:00:01.200+08:00',
+                  },
+                }),
+              ].join('\n') + '\n'));
+              finishStream = () => {
+                controller.enqueue(encoder.encode([
+                  JSON.stringify({ type: 'result', result: { success: true, answer: '实时轨迹任务完成' } }),
+                  JSON.stringify({ type: 'done', run_id: 'run-ui-live' }),
+                ].join('\n') + '\n'));
+                controller.close();
+              };
+            },
+          });
+          return Promise.resolve(new Response(stream, {
+            status: 200,
+            headers: { 'Content-Type': 'application/x-ndjson' },
+          }));
+        }
+        return jsonResponse({ detail: 'Not found' }, 404);
+      }),
+    );
+    render(<App />);
+
+    await createConversation(user);
+    await user.type(screen.getByLabelText('任务内容'), '点击页面按钮');
+    await user.click(screen.getByRole('button', { name: '发送任务' }));
+
+    await screen.findByText('执行 agent_browser_click');
+    const runningTrajectory = document.querySelector('.message.is-running .trajectory');
+    expect(runningTrajectory).toBeInTheDocument();
+    expect(runningTrajectory?.querySelector('summary svg')).toBeInTheDocument();
+    expect(document.querySelector('.message.is-running .activity-line')).toBeInTheDocument();
+    expect(screen.queryByText(/^操作了 /)).not.toBeInTheDocument();
+
+    await act(async () => finishStream?.());
+
+    expect(await screen.findByText('实时轨迹任务完成')).toBeInTheDocument();
+    expect(screen.getByText('操作了 1.2s')).toBeInTheDocument();
+  });
+
+  it('删除运行中的会话时先等待任务取消，再关闭浏览器会话', async () => {
+    const user = userEvent.setup();
+    const encoder = new TextEncoder();
+    const lifecycle: string[] = [];
+    let startedRunId = '';
+    mockChromeStorage();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith('/health')) return jsonResponse({ status: 'ok' });
+        if (url.includes('/browser/sessions/') && init?.method === 'DELETE') {
+          lifecycle.push('session_closed');
+          return jsonResponse({ closed: true });
+        }
+        if (url.includes('/browser/sessions/')) {
+          return jsonResponse({ detail: 'Browser session not found' }, 404);
+        }
+        if (url.endsWith('/browser/session/start')) {
+          return jsonResponse({ browser_session_id: 'browser-agent-test', mode: 'isolated', ready: true });
+        }
+        if (url.endsWith('/agent/run/stream')) {
+          startedRunId = JSON.parse(String(init?.body)).run_id;
+          const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(encoder.encode([
+                JSON.stringify({ type: 'run_started', run_id: startedRunId }),
+                JSON.stringify({
+                  type: 'trace',
+                  event: {
+                    kind: 'thinking',
+                    status: 'running',
+                    title: '正在分析页面',
+                    timestamp: '2026-08-03T14:00:00.000+08:00',
+                  },
+                }),
+              ].join('\n') + '\n'));
+            },
+          });
+          return Promise.resolve(new Response(stream, {
+            status: 200,
+            headers: { 'Content-Type': 'application/x-ndjson' },
+          }));
+        }
+        if (startedRunId && url.endsWith(`/agent/runs/${startedRunId}`) && init?.method === 'DELETE') {
+          lifecycle.push('run_cancelled');
+          return jsonResponse({ cancelled: true, run_id: startedRunId });
+        }
+        return jsonResponse({ detail: 'Not found' }, 404);
+      }),
+    );
+    render(<App />);
+
+    await createConversation(user);
+    await user.type(screen.getByLabelText('任务内容'), '保持运行');
+    await user.click(screen.getByRole('button', { name: '发送任务' }));
+    await screen.findByText('正在分析页面');
+    await user.click(screen.getByRole('button', { name: '打开会话' }));
+    await user.click(screen.getByRole('button', { name: '删除会话：保持运行' }));
+
+    await waitFor(() => expect(lifecycle).toEqual(['run_cancelled', 'session_closed']));
+  });
+
+  it('在对话中只用文字展示可折叠任务轨迹，不显示 JSON 参数', async () => {
     const user = userEvent.setup();
     mockChromeStorage();
     vi.stubGlobal(
@@ -664,6 +863,7 @@ describe('Browser Agent 侧边栏', () => {
     await user.click(trajectory);
     expect(details).toHaveAttribute('open');
     expect(screen.getByText('执行 agent_browser_click')).toBeInTheDocument();
+    expect(screen.queryByText('{"selector":"@e1"}')).not.toBeInTheDocument();
 
     await user.click(trajectory);
     expect(details).not.toHaveAttribute('open');

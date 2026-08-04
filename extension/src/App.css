@@ -474,21 +474,6 @@ textarea:disabled {
   color: var(--danger);
 }
 
-.trajectory code {
-  display: block;
-  max-height: 82px;
-  margin-top: 3px;
-  padding: 5px 6px;
-  overflow: auto;
-  border-radius: 5px;
-  background: var(--canvas);
-  color: var(--muted);
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: 9.5px;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
 .activity-line::after {
   position: absolute;
   width: 36px;

@@ -93,12 +93,6 @@ interface AgentRunPayload {
   llm_model?: string;
 }
 
-interface LLMConfigResult {
-  configured: boolean;
-  api_url: string;
-  model: string;
-}
-
 interface PageContext {
   url: string;
   title: string;
@@ -207,10 +201,6 @@ function isModelConfig(value: unknown): value is ModelConfig {
     typeof candidate.apiKey === 'string' &&
     typeof candidate.model === 'string'
   );
-}
-
-function isCompleteModelConfig(config: ModelConfig) {
-  return Boolean(config.apiUrl.trim() && config.apiKey.trim() && config.model.trim());
 }
 
 function isModelSelection(value: unknown): value is ModelSelection {
@@ -406,18 +396,6 @@ function apiErrorMessage(body: unknown, status: number) {
   return `请求失败 (${status})`;
 }
 
-async function configureLlm(config: ModelConfig, signal?: AbortSignal) {
-  return requestJson<LLMConfigResult>('/llm/config', {
-    method: 'PUT',
-    signal,
-    body: JSON.stringify({
-      api_url: config.apiUrl.trim().replace(/\/$/, ''),
-      api_key: config.apiKey.trim(),
-      model: config.model.trim(),
-    }),
-  });
-}
-
 async function syncModelSettings(settings: ModelSettings, signal?: AbortSignal) {
   return requestJson<{ configured: boolean }>('/llm/configs', {
     method: 'PUT',
@@ -533,6 +511,9 @@ async function ensureBrowserSession(
     if (!(error instanceof ApiError) || error.status !== 404) throw error;
   }
 
+  // URL 只用于选择初始标签页，不限制会话可访问的页面集合。
+  const startupExpectedUrl =
+    mode === 'current' ? (await readCurrentTabUrl()) || expectedUrl : undefined;
   try {
     return await requestJson<BrowserSessionResult>('/browser/session/start', {
       method: 'POST',
@@ -540,7 +521,7 @@ async function ensureBrowserSession(
       body: JSON.stringify({
         browser_session_id: sessionId,
         mode,
-        ...(mode === 'current' && expectedUrl && { expected_url: expectedUrl }),
+        ...(mode === 'current' && startupExpectedUrl && { expected_url: startupExpectedUrl }),
       }),
     });
   } catch (error) {
@@ -791,7 +772,7 @@ function BrowserChoiceDialog({
             <Browser size={22} aria-hidden="true" />
             <span>
               <strong>当前浏览器</strong>
-              <small>连接现在打开的网页，连接失败时直接提示。</small>
+              <small>连接当前 Chrome，可操作已有页面并打开新页面。</small>
             </span>
           </button>
           <button type="button" disabled={busy} aria-label="使用独立浏览器" onClick={() => onChoose('isolated')}>
@@ -847,7 +828,13 @@ function EmptyChat({
   );
 }
 
-function TaskTrajectory({ events }: { events: TraceEvent[] }) {
+function TaskTrajectory({
+  events,
+  completed = true,
+}: {
+  events: TraceEvent[];
+  completed?: boolean;
+}) {
   if (!events.length) return null;
 
   // 直接复用轨迹时间戳，避免为纯展示额外启动计时器。
@@ -861,15 +848,14 @@ function TaskTrajectory({ events }: { events: TraceEvent[] }) {
 
   return (
     <details className="trajectory">
-      <summary>
-        <span>操作了 {duration}s</span>
+      <summary aria-label={completed ? undefined : '展开执行轨迹'}>
+        {completed && <span>操作了 {duration}s</span>}
         <CaretRight size={11} weight="bold" aria-hidden="true" />
       </summary>
       <ol>
         {events.map((event, index) => (
           <li className={`is-${event.status}`} key={`${event.step_id || event.kind}-${index}`}>
             <span>{event.title}</span>
-            {event.detail && <code>{event.detail}</code>}
           </li>
         ))}
       </ol>
@@ -918,7 +904,7 @@ function MessageThread({
           <div className="message-body">
             <span className="message-author">Browser Agent</span>
             <p>{phase === 'starting' ? '正在准备浏览器' : '正在执行任务'}</p>
-            <TaskTrajectory events={liveTrace} />
+            <TaskTrajectory events={liveTrace} completed={false} />
             <span className="activity-line" aria-hidden="true" />
           </div>
         </article>
@@ -1407,9 +1393,6 @@ export default function App() {
         if (mounted) {
           setModelSettings(storedModelSettings);
           setDraftSelection(storedModelSettings.defaultSelection);
-          if (enabledModelOptions(storedModelSettings).length) {
-            void syncModelSettings(storedModelSettings).catch(() => undefined);
-          }
         }
       } finally {
         if (mounted) setStorageReady(true);
@@ -1424,18 +1407,24 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!storageReady) return undefined;
     let mounted = true;
     const controller = new AbortController();
     const loadPageSuggestions = async () => {
+      if (!enabledModelOptions(modelSettings).length) {
+        setSuggestions([]);
+        setSuggestionsLoading(false);
+        return;
+      }
+      if (mounted) {
+        setSuggestions([]);
+        setSuggestionsLoading(true);
+      }
       try {
-        const [storedConfig, page] = await Promise.all([
-          readStoredValue<unknown>(MODEL_CONFIG_STORAGE_KEY),
-          readCurrentPage(),
-        ]);
-        if (!isModelConfig(storedConfig) || !isCompleteModelConfig(storedConfig) || !page) return;
+        const page = await readCurrentPage();
+        if (!page) return;
 
-        if (mounted) setSuggestionsLoading(true);
-        await configureLlm(storedConfig, controller.signal);
+        await syncModelSettings(modelSettings, controller.signal);
         const result = await requestJson<PageSuggestionsResult>('/page/suggestions', {
           method: 'POST',
           signal: controller.signal,
@@ -1464,7 +1453,7 @@ export default function App() {
       mounted = false;
       controller.abort();
     };
-  }, []);
+  }, [modelSettings, storageReady]);
 
   useEffect(() => {
     if (!storageReady) return;
@@ -1513,9 +1502,6 @@ export default function App() {
     setBrowserBindingError(null);
     try {
       const targetUrl = mode === 'current' ? await readCurrentTabUrl() : null;
-      if (mode === 'current' && !targetUrl) {
-        throw new Error('当前标签页不是可连接的网页，请先打开一个 HTTP(S) 页面。');
-      }
 
       requestController.current?.abort();
       const now = Date.now();
@@ -1582,11 +1568,31 @@ export default function App() {
     }
   };
 
-  const deleteSession = (sessionId: string) => {
+  const deleteSession = async (sessionId: string) => {
+    const deletingActiveSession = activeSessionId === sessionId;
+    const runId = deletingActiveSession ? activeRunId.current : null;
+    const controller = deletingActiveSession ? requestController.current : null;
     setSessions((current) => current.filter((session) => session.id !== sessionId));
-    if (activeSessionId === sessionId) setActiveSessionId(null);
+    if (deletingActiveSession) setActiveSessionId(null);
+
+    // 先等待 Agent 的 finally 移除页面覆盖层，再断开浏览器 runtime。
+    if (runId) {
+      await fetch(`${BACKEND_URL}/agent/runs/${runId}`, { method: 'DELETE' }).catch(() => undefined);
+    }
+    if (deletingActiveSession) {
+      controller?.abort();
+      if (requestController.current === controller) {
+        requestController.current = null;
+        activeRunId.current = null;
+        setLiveTrace([]);
+        setPhase('idle');
+        setError(null);
+        setFailedTask(null);
+      }
+    }
+
     // 删除对话时同步回收它独占的浏览器 runtime，避免历史会话越积越多。
-    void fetch(`${BACKEND_URL}/browser/sessions/${browserSessionId(sessionId)}`, {
+    await fetch(`${BACKEND_URL}/browser/sessions/${browserSessionId(sessionId)}`, {
       method: 'DELETE',
     }).catch(() => undefined);
   };
