@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from typing import TYPE_CHECKING, Any
 
-from pydantic import ValidationError
+from openai import APIConnectionError, APITimeoutError
 
+from app.llm_provider import OpenAIResponsesAdapter, ProviderAdapter
 from app.models import AgentDecision, AgentTokenUsage
 from app.trace import redact_value
 from app.utils.tools import format_mcp_tools
@@ -67,6 +70,7 @@ BROWSER_AGENT_SYSTEM_PROMPT = """
 - 当前快照已包含用户所需信息时直接回答，不要为了验证而额外点击或重复读取。
 - 总结内容时应包含可见标题和正文要点，不能只返回作者或链接。
 - 不要调用工具读取快照中已经清楚显示的标题、URL 或正文。
+- 快照缺少文章、帖子或评论正文时，优先调用一次 agent_browser_read 读取当前页面，不要连续尝试 get_text 或 eval。
 - 浏览器状态会自动刷新，不要主动请求快照工具。
 - 页面未加载完成时等待；弹窗、遮罩或 Cookie 提示阻挡目标操作时优先处理。
 </浏览器规则>
@@ -121,18 +125,43 @@ blocked 的最终答案必须说明任务尚未完成、阻塞证据、已有结
 """.strip()
 
 
+class AgentLLMCallError(RuntimeError):
+    """携带失败调用观测数据，同时保留底层异常类型和消息。"""
+
+    def __init__(
+        self,
+        cause: Exception,
+        token_usage: AgentTokenUsage,
+    ):
+        self.cause = cause
+        self.error_type = getattr(cause, "error_type", type(cause).__name__)
+        self.details = getattr(cause, "details", None)
+        self.token_usage = token_usage
+        super().__init__(str(cause) or self.error_type)
+
+
 class AgentLLM:
     OBSERVATION_LIMIT = 20_000
     OBSERVATION_SNAPSHOT_LIMIT = 16_000
     TASK_CONTEXT_LIMIT = 6_000
     TASK_CONTEXT_ITEM_LIMIT = 2_500
+    FRESH_TASK_CONTEXT_LIMIT = 16_000
+    FRESH_TASK_CONTEXT_ITEM_LIMIT = 13_000
     CONVERSATION_CONTEXT_LIMIT = 12_000
     CONVERSATION_SUMMARY_LIMIT = 2_000
     MESSAGE_LIMIT = 10
 
-    def __init__(self, client: AsyncOpenAI, model: str):
+    def __init__(
+        self,
+        client: AsyncOpenAI,
+        model: str,
+        provider_adapter: ProviderAdapter | None = None,
+    ):
         self.client = client
         self.model = model
+        self.provider_adapter = (
+            provider_adapter or OpenAIResponsesAdapter(client)
+        )
 
     async def decide(
         self,
@@ -149,6 +178,10 @@ class AgentLLM:
             else "(none)"
         )
         observation_text = self._format_observation(observation)
+        input_metrics = self._formatted_input_metrics(
+            observation_text,
+            task_context_text,
+        )
         tool_descriptions = format_mcp_tools(tools)
         conversation_messages = self._limit_conversation_messages(messages)
         state_text = self._build_state_message(
@@ -164,39 +197,118 @@ class AgentLLM:
             *conversation_messages,
             {"role": "user", "content": state_text},
         ]
-        current_input = input_messages
+        attempted_input_characters = 0
         for attempt in range(2):
+            attempt_count = attempt + 1
+            attempted_input_characters += sum(
+                len(str(message.get("content", "")))
+                for message in input_messages
+            )
             try:
-                response = await self.client.responses.parse(
+                provider_result = await self.provider_adapter.decide(
                     model=self.model,
-                    input=current_input,
-                    text_format=AgentDecision,
+                    input_messages=input_messages,
                 )
-                if response.output_parsed is None:
-                    raise ValueError(
-                        "OpenAI response did not contain an AgentDecision"
-                    )
+                response = provider_result.raw_response
+                provider_calls = provider_result.llm_calls
+                failed_calls = attempt + provider_result.failed_llm_calls
+                provider_unavailable = (
+                    provider_calls
+                    if provider_result.usage_unavailable_calls is None
+                    and getattr(response, "usage", None) is None
+                    else int(provider_result.usage_unavailable_calls or 0)
+                )
                 return (
-                    response.output_parsed,
+                    provider_result.decision,
                     self._extract_token_usage(
                         response,
-                        input_characters=sum(
-                            len(str(message.get("content", "")))
-                            for message in current_input
+                        llm_calls=attempt + provider_calls,
+                        failed_llm_calls=failed_calls,
+                        usage_unavailable_calls=(
+                            attempt + provider_unavailable
                         ),
-                        observation_characters=len(observation_text),
+                        input_characters=(
+                            attempted_input_characters
+                            + provider_result.additional_input_characters
+                        ),
+                        **{
+                            key: value * attempt_count
+                            for key, value in input_metrics.items()
+                        },
                     ),
                 )
-            except (ValidationError, ValueError):
-                if attempt == 1:
-                    raise
-                current_input = [dict(message) for message in input_messages]
-                current_input[-1]["content"] = (
-                    f"{current_input[-1]['content']}\n\n"
-                    "Your previous response was invalid. Return a valid structured "
-                    "decision that follows the status-specific output rules."
-                )
+            except Exception as exc:
+                if (
+                    attempt == 0
+                    and self._is_transient_error(exc)
+                ):
+                    continue
+                raise self._failed_call_error(
+                    exc,
+                    attempts=attempt_count,
+                    input_characters=attempted_input_characters,
+                    input_metrics=input_metrics,
+                ) from exc
         raise RuntimeError("unreachable")
+
+    @staticmethod
+    def _is_transient_error(exc: Exception) -> bool:
+        """连接波动、超时和可恢复 HTTP 状态只额外尝试一次。"""
+        return (
+            isinstance(exc, (APIConnectionError, APITimeoutError))
+            or getattr(exc, "status_code", None)
+            in {408, 429, 500, 502, 503, 504}
+        )
+
+    @classmethod
+    def _failed_call_error(
+        cls,
+        cause: Exception,
+        *,
+        attempts: int,
+        input_characters: int,
+        input_metrics: dict[str, int],
+    ) -> AgentLLMCallError:
+        """服务未返回 usage 时，仍记录调用次数和实际发送字符数。"""
+        prior_attempts = attempts - 1
+        provider_calls = int(getattr(cause, "llm_calls", 1) or 1)
+        llm_calls = prior_attempts + provider_calls
+        failed_calls = prior_attempts + int(
+            getattr(cause, "failed_llm_calls", provider_calls)
+        )
+        usage_unavailable_calls = prior_attempts + int(
+            getattr(cause, "usage_unavailable_calls", provider_calls)
+        )
+        input_characters += int(
+            getattr(cause, "additional_input_characters", 0) or 0
+        )
+        raw_response = getattr(cause, "raw_response", None)
+        if raw_response is not None:
+            token_usage = cls._extract_token_usage(
+                raw_response,
+                llm_calls=llm_calls,
+                failed_llm_calls=failed_calls,
+                usage_unavailable_calls=usage_unavailable_calls,
+                input_characters=input_characters,
+                **{
+                    key: value * attempts
+                    for key, value in input_metrics.items()
+                },
+            )
+            return AgentLLMCallError(cause, token_usage)
+        return AgentLLMCallError(
+            cause,
+            AgentTokenUsage(
+                llm_calls=llm_calls,
+                failed_llm_calls=failed_calls,
+                usage_unavailable_calls=usage_unavailable_calls,
+                input_characters=input_characters,
+                **{
+                    key: value * attempts
+                    for key, value in input_metrics.items()
+                },
+            ),
+        )
 
     async def compact_conversation_history(
         self,
@@ -255,11 +367,11 @@ class AgentLLM:
             ),
         )
 
-    @staticmethod
-    def _build_system_prompt(tool_descriptions: str) -> str:
+    def _build_system_prompt(self, tool_descriptions: str) -> str:
         """把稳定行为规则与本轮可用工具说明组成系统提示词。"""
         return (
-            f"{BROWSER_AGENT_SYSTEM_PROMPT}\n\n"
+            f"{BROWSER_AGENT_SYSTEM_PROMPT}\n"
+            f"- {self.provider_adapter.output_instructions}\n\n"
             "<当前可用浏览器工具>\n"
             f"{tool_descriptions}\n"
             "</当前可用浏览器工具>"
@@ -296,15 +408,46 @@ class AgentLLM:
     @staticmethod
     def _extract_token_usage(
         response: Any,
+        llm_calls: int = 1,
+        failed_llm_calls: int = 0,
+        usage_unavailable_calls: int | None = None,
         input_characters: int = 0,
         observation_characters: int = 0,
-    ) -> AgentTokenUsage | None:
+        observation_source_characters: int = 0,
+        observation_sent_snapshot_characters: int = 0,
+        observation_truncated_characters: int = 0,
+        task_context_characters: int = 0,
+    ) -> AgentTokenUsage:
         """读取 Responses API 返回的令牌用量。"""
         usage = response.usage
         if usage is None:
-            return None
+            return AgentTokenUsage(
+                llm_calls=llm_calls,
+                failed_llm_calls=failed_llm_calls,
+                usage_unavailable_calls=(
+                    llm_calls
+                    if usage_unavailable_calls is None
+                    else usage_unavailable_calls
+                ),
+                input_characters=input_characters,
+                observation_characters=observation_characters,
+                observation_source_characters=observation_source_characters,
+                observation_sent_snapshot_characters=(
+                    observation_sent_snapshot_characters
+                ),
+                observation_truncated_characters=(
+                    observation_truncated_characters
+                ),
+                task_context_characters=task_context_characters,
+            )
         return AgentTokenUsage(
-            llm_calls=1,
+            llm_calls=llm_calls,
+            failed_llm_calls=failed_llm_calls,
+            usage_unavailable_calls=(
+                failed_llm_calls
+                if usage_unavailable_calls is None
+                else usage_unavailable_calls
+            ),
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             total_tokens=usage.total_tokens,
@@ -312,7 +455,58 @@ class AgentLLM:
             reasoning_tokens=usage.output_tokens_details.reasoning_tokens,
             input_characters=input_characters,
             observation_characters=observation_characters,
+            observation_source_characters=(
+                observation_source_characters
+            ),
+            observation_sent_snapshot_characters=(
+                observation_sent_snapshot_characters
+            ),
+            observation_truncated_characters=(
+                observation_truncated_characters
+            ),
+            task_context_characters=task_context_characters,
         )
+
+    @classmethod
+    def input_metrics(
+        cls,
+        observation: Any,
+        task_context: list[dict[str, Any]],
+    ) -> dict[str, int]:
+        observation_text = cls._format_observation(observation)
+        task_context_text = (
+            cls._format_task_context(task_context)
+            if task_context
+            else "(none)"
+        )
+        return cls._formatted_input_metrics(
+            observation_text,
+            task_context_text,
+        )
+
+    @staticmethod
+    def _formatted_input_metrics(
+        observation_text: str,
+        task_context_text: str,
+    ) -> dict[str, int]:
+        try:
+            observation = json.loads(observation_text)
+        except json.JSONDecodeError:
+            observation = {}
+        meta = observation.get("snapshot_meta", {})
+        sent_snapshot = len(str(observation.get("snapshot", "")))
+        source = meta.get("source_characters", sent_snapshot)
+        sent_snapshot = meta.get("sent_characters", sent_snapshot)
+        return {
+            "observation_characters": len(observation_text),
+            "observation_source_characters": source,
+            "observation_sent_snapshot_characters": sent_snapshot,
+            "observation_truncated_characters": max(
+                0,
+                source - sent_snapshot,
+            ),
+            "task_context_characters": len(task_context_text),
+        }
 
     @classmethod
     def _format_observation(cls, observation: Any) -> str:
@@ -331,6 +525,23 @@ class AgentLLM:
                     cls.OBSERVATION_SNAPSHOT_LIMIT,
                     "snapshot",
                 )
+                digest = hashlib.sha256(snapshot.encode("utf-8")).hexdigest()
+                formatted["observation_id"] = digest[:16]
+                formatted["snapshot_meta"] = {
+                    "sha256": digest,
+                    "source_characters": len(snapshot),
+                    "sent_characters": len(formatted["snapshot"]),
+                    "truncated": len(formatted["snapshot"]) < len(snapshot),
+                    "ref_count": len(
+                        set(
+                            re.findall(
+                                r"(?:\[\s*ref\s*=\s*|@)(e\d+)",
+                                snapshot,
+                                flags=re.IGNORECASE,
+                            )
+                        )
+                    ),
+                }
 
             for key in ("url", "title", "origin", "lifecycle"):
                 value = payload.get(key)
@@ -378,6 +589,10 @@ class AgentLLM:
                         new_limit,
                         "snapshot",
                     )
+                    formatted["snapshot_meta"]["sent_characters"] = len(
+                        formatted["snapshot"]
+                    )
+                    formatted["snapshot_meta"]["truncated"] = True
                     text = json.dumps(
                         formatted,
                         ensure_ascii=False,
@@ -396,6 +611,11 @@ class AgentLLM:
         task_context: list[dict[str, Any]],
     ) -> str:
         """从最近结果向前装入完整 JSON，避免字符串硬截断造成无效结构。"""
+        limit = (
+            cls.FRESH_TASK_CONTEXT_LIMIT
+            if any(item.get("_fresh") is True for item in task_context)
+            else cls.TASK_CONTEXT_LIMIT
+        )
         selected: list[Any] = []
         for item in reversed(task_context):
             compact_item = cls._compact_context_item(item)
@@ -405,7 +625,7 @@ class AgentLLM:
                 ensure_ascii=False,
                 default=str,
             )
-            if len(text) > cls.TASK_CONTEXT_LIMIT:
+            if len(text) > limit:
                 if selected:
                     break
                 selected = [compact_item]
@@ -415,13 +635,27 @@ class AgentLLM:
 
     @classmethod
     def _compact_context_item(cls, item: dict[str, Any]) -> Any:
-        compact_item = cls._compact_value(item)
+        fresh = item.get("_fresh") is True
+        compact_item = cls._compact_value(
+            {
+                key: value
+                for key, value in item.items()
+                if key != "_fresh"
+            },
+            string_limit=(12_000 if fresh else 2_000),
+            list_limit=(50 if fresh else 20),
+        )
         text = json.dumps(
             compact_item,
             ensure_ascii=False,
             default=str,
         )
-        if len(text) <= cls.TASK_CONTEXT_ITEM_LIMIT:
+        item_limit = (
+            cls.FRESH_TASK_CONTEXT_ITEM_LIMIT
+            if fresh
+            else cls.TASK_CONTEXT_ITEM_LIMIT
+        )
+        if len(text) <= item_limit:
             return compact_item
 
         data = compact_item.get("data") if isinstance(compact_item, dict) else None
@@ -471,18 +705,35 @@ class AgentLLM:
         ]
 
     @classmethod
-    def _compact_value(cls, value: Any) -> Any:
+    def _compact_value(
+        cls,
+        value: Any,
+        *,
+        string_limit: int = 2_000,
+        list_limit: int = 20,
+    ) -> Any:
         """限制上下文字段体积，并剔除页面树的重复副本。"""
         if isinstance(value, str):
-            return cls._truncate_text(value, 2_000, "text")
+            return cls._truncate_text(value, string_limit, "text")
         if isinstance(value, dict):
             return {
-                key: cls._compact_value(item)
+                key: cls._compact_value(
+                    item,
+                    string_limit=string_limit,
+                    list_limit=list_limit,
+                )
                 for key, item in value.items()
                 if key not in {"refs", "snapshot"}
             }
         if isinstance(value, list):
-            return [cls._compact_value(item) for item in value[-20:]]
+            return [
+                cls._compact_value(
+                    item,
+                    string_limit=string_limit,
+                    list_limit=list_limit,
+                )
+                for item in value[-list_limit:]
+            ]
         return value
 
     @staticmethod

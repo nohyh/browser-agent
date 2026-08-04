@@ -54,6 +54,8 @@ class AgentTokenUsage(BaseModel):
     """一次 Agent 任务内由模型服务报告的 Token 用量总和。"""
 
     llm_calls: int = 0
+    failed_llm_calls: int = 0
+    usage_unavailable_calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
@@ -61,10 +63,21 @@ class AgentTokenUsage(BaseModel):
     reasoning_tokens: int = 0
     input_characters: int = 0
     observation_characters: int = 0
+    observation_source_characters: int = 0
+    observation_sent_snapshot_characters: int = 0
+    observation_truncated_characters: int = 0
+    task_context_characters: int = 0
 
     def merged(self, other: "AgentTokenUsage") -> "AgentTokenUsage":
         return AgentTokenUsage(
             llm_calls=self.llm_calls + other.llm_calls,
+            failed_llm_calls=(
+                self.failed_llm_calls + other.failed_llm_calls
+            ),
+            usage_unavailable_calls=(
+                self.usage_unavailable_calls
+                + other.usage_unavailable_calls
+            ),
             input_tokens=self.input_tokens + other.input_tokens,
             output_tokens=self.output_tokens + other.output_tokens,
             total_tokens=self.total_tokens + other.total_tokens,
@@ -78,6 +91,22 @@ class AgentTokenUsage(BaseModel):
             observation_characters=(
                 self.observation_characters
                 + other.observation_characters
+            ),
+            observation_source_characters=(
+                self.observation_source_characters
+                + other.observation_source_characters
+            ),
+            observation_sent_snapshot_characters=(
+                self.observation_sent_snapshot_characters
+                + other.observation_sent_snapshot_characters
+            ),
+            observation_truncated_characters=(
+                self.observation_truncated_characters
+                + other.observation_truncated_characters
+            ),
+            task_context_characters=(
+                self.task_context_characters
+                + other.task_context_characters
             ),
         )
 

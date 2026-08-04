@@ -1,13 +1,14 @@
 """浏览器 Agent 的最小执行循环与结构化输出模型。"""
 
+import asyncio
 import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from app.llm import AgentLLM
-from app.mcp_client import BrowserService
+from app.mcp_client import BrowserService, VISUAL_OVERLAY_CLEANUP_SCRIPT
 from app.models import (
     AgentAction,
     AgentDecision,
@@ -184,18 +185,13 @@ VISUAL_OVERLAY_SCRIPT = r"""
   return true;
 })()
 """
-VISUAL_OVERLAY_CLEANUP_SCRIPT = r"""
-(() => {
-  const host = document.getElementById('browser-agent-visual-layer');
-  if (host) host.remove();
-  delete window.__browserAgentVisual;
-  return true;
-})()
-"""
-
-
 class Agent:
     """负责观察页面、请求 LLM 决策并执行浏览器动作。"""
+
+    FRESH_RESULT_TEXT_LIMIT = 12_000
+    FRESH_RESULT_COUNT_LIMIT = 3
+    RESULT_SUMMARY_PREVIEW_LIMIT = 800
+    REPEATED_ACTION_LIMIT = 3
 
     def __init__(
         self,
@@ -204,6 +200,7 @@ class Agent:
         llm: AgentLLM,
         max_steps: int = 20,
         trace_file: Path | None = None,
+        event_sink: Callable[[dict[str, Any]], None] | None = None,
     ):
         initial_message = {"role": "user", "content": task}
         # messages 保存完整对话；task_context 只保存当前任务的运行信息。
@@ -215,12 +212,19 @@ class Agent:
         #前面被压缩的消息总数，作为指针继续压缩未压缩的部分
         self._summary_message_count = 0
         self._conversation_compaction_attempted = False
-        self.tracer = TraceRecorder(trace_file, self._tool_outcome)
+        self.tracer = TraceRecorder(
+            trace_file,
+            self._tool_outcome,
+            event_sink=event_sink,
+        )
         self._record({"type": "message", **initial_message})
         self.browser = browser
         self.llm = llm
         self.max_steps = max_steps
         self._visual_overlay_started = False
+        self._run_count = 0
+        self._last_action_signature: str | None = None
+        self._repeated_action_count = 0
 
     @property
     def trace(self) -> list[dict[str, Any]]:
@@ -229,12 +233,17 @@ class Agent:
     def _record(self, event: dict[str, Any]) -> None:
         self.tracer.record(event)
 
-    async def observe(self, browser_session_id: str) -> Any:
+    async def observe(
+        self,
+        browser_session_id: str,
+        trace_context: dict[str, str] | None = None,
+    ) -> Any:
         """获取当前页面的交互元素快照，作为本轮唯一页面状态。"""
         return await self._call_tool(
             browser_session_id=browser_session_id,
             name="agent_browser_snapshot",
             arguments={"interactive": True, "compact": True},
+            trace_context=trace_context,
         )
 
     def add_user_message(self, content: str) -> None:
@@ -247,25 +256,66 @@ class Agent:
     async def run(self, browser_session_id: str) -> AgentResult:
         """循环执行“观察、决策、动作”，直到完成或达到最大步数。"""
         self._visual_overlay_started = False
+        self._last_action_signature = None
+        self._repeated_action_count = 0
+        self._run_count += 1
+        run_id = f"run-{self._run_count}"
         try:
-            return await self._run_loop(browser_session_id)
+            return await self._run_loop(browser_session_id, run_id)
         finally:
             if self._visual_overlay_started:
-                await self._remove_visual_overlay(browser_session_id)
+                await self._remove_visual_overlay(
+                    browser_session_id,
+                    {
+                        "run_id": run_id,
+                        "step_id": f"{run_id}:cleanup",
+                        "action_id": f"{run_id}:cleanup:visual-overlay",
+                    },
+                )
 
-    async def _run_loop(self, browser_session_id: str) -> AgentResult:
+    async def _run_loop(
+        self,
+        browser_session_id: str,
+        run_id: str,
+    ) -> AgentResult:
         """执行 Agent 主循环，由调用方统一管理可视化层生命周期。"""
         observation: Any = None
+        observation_id: str | None = None
         observation_fingerprint: tuple[str | None, str] | None = None
         observation_required = True
         pending_outcome: dict[str, Any] | None = None
         pending_fingerprint: tuple[str | None, str] | None = None
         token_usage = await self._maybe_compact_conversation()
 
-        for _ in range(self.max_steps):
+        for step_number in range(1, self.max_steps + 1):
+            step_id = f"{run_id}:step-{step_number}"
             try:
                 if observation_required:
-                    observation = await self.observe(browser_session_id)
+                    observation_id = f"{step_id}:observation"
+                    observation = await self.observe(
+                        browser_session_id,
+                        {
+                            "run_id": run_id,
+                            "step_id": step_id,
+                            "action_id": observation_id,
+                        },
+                    )
+                    stabilization_retried = False
+                    if (
+                        pending_outcome is not None
+                        and self._observation_is_empty(observation)
+                    ):
+                        stabilization_retried = True
+                        await asyncio.sleep(0.2)
+                        observation_id = f"{step_id}:observation-retry"
+                        observation = await self.observe(
+                            browser_session_id,
+                            {
+                                "run_id": run_id,
+                                "step_id": step_id,
+                                "action_id": observation_id,
+                            },
+                        )
                     self._record_page_visit(observation)
                     new_fingerprint = self._page_fingerprint(observation)
                     if pending_outcome is not None:
@@ -274,6 +324,20 @@ class Agent:
                             before=pending_fingerprint,
                             after=new_fingerprint,
                         )
+                        pending_outcome["effect"][
+                            "observation_id"
+                        ] = observation_id
+                        pending_outcome["effect"].update(
+                            {
+                                "stabilization_retried": (
+                                    stabilization_retried
+                                ),
+                                "stabilized": not self._observation_is_empty(
+                                    observation
+                                ),
+                            }
+                        )
+                        self._record(pending_outcome.copy())
                     observation_fingerprint = new_fingerprint
                     observation_required = False
                     pending_outcome = None
@@ -283,13 +347,21 @@ class Agent:
                 allowed_names = REGISTERED_TOOL_NAMES | TOOL_GETTER_NAMES
                 llm_task_context = self._llm_task_context()
                 llm_messages = self._llm_messages()
+                input_metrics = self.llm.input_metrics(
+                    observation,
+                    llm_task_context,
+                )
                 self._record(
                     {
                         "type": "llm_call",
+                        "run_id": run_id,
+                        "step_id": step_id,
+                        "observation_id": observation_id,
                         "browser_session_id": browser_session_id,
                         "observation": observation,
                         "messages": llm_messages,
                         "task_context": llm_task_context,
+                        "input_metrics": input_metrics,
                     }
                 )
                 # 调用 LLM 获取下一步动作决策及本轮 Token 消耗
@@ -308,23 +380,47 @@ class Agent:
                     )
                 llm_result = {
                     "type": "llm_result",
+                    "run_id": run_id,
+                    "step_id": step_id,
                     "output": decision.model_dump(),
                 }
                 if call_usage is not None:
                     llm_result["token_usage"] = call_usage.model_dump()
                 self._record(llm_result)
+                # 大型工具正文只完整进入紧邻的一轮，之后收敛为摘要和哈希。
+                self._consume_fresh_results()
             except Exception as exc:
-                self._record(
-                    {
-                        "type": "error",
-                        "stage": "loop",
-                        "error_type": type(exc).__name__,
-                        "error": str(exc) or type(exc).__name__,
-                    }
+                failed_usage = getattr(exc, "token_usage", None)
+                if isinstance(failed_usage, AgentTokenUsage):
+                    token_usage = (
+                        failed_usage
+                        if token_usage is None
+                        else token_usage.merged(failed_usage)
+                    )
+                error_type = getattr(
+                    exc,
+                    "error_type",
+                    type(exc).__name__,
                 )
+                error_event = {
+                    "type": "error",
+                    "stage": "loop",
+                    "error_type": error_type,
+                    "error": str(exc) or error_type,
+                }
+                provider_details = getattr(exc, "details", None)
+                if provider_details is not None:
+                    error_event["provider_details"] = provider_details
+                self._record(error_event)
+                if str(error_type).startswith("provider_output_"):
+                    answer = (
+                        "模型返回格式异常，未能生成可靠的最终结果，请重试。"
+                    )
+                else:
+                    answer = f"Agent decision failed: {exc}"
                 return self._finish(
                     success=False,
-                    answer=f"Agent decision failed: {exc}",
+                    answer=answer,
                     token_usage=token_usage,
                 )
 
@@ -349,23 +445,60 @@ class Agent:
             )
 
             # 限制单轮动作数量，避免模型一次生成过长且难以验证的操作链。
-            for action in decision.actions:
+            for action_number, action in enumerate(decision.actions, start=1):
                 action = self._normalize_action(action)
+                action_context = {
+                    "run_id": run_id,
+                    "step_id": step_id,
+                    "action_id": f"{step_id}:action-{action_number}",
+                    "browser_session_id": browser_session_id,
+                }
                 if action.name not in allowed_names:
                     rejected_result = self._tool_outcome(
                         name=action.name,
                         arguments=action.arguments,
                         error="tool is not registered",
+                        trace_context=action_context,
                     )
                     self._append_task_context(rejected_result)
                     self._record(rejected_result.copy())
                     break
 
+                if self._register_action(
+                    action,
+                    observation_fingerprint,
+                ) >= self.REPEATED_ACTION_LIMIT:
+                    message = (
+                        "RepeatedAction: identical action made no page "
+                        "progress twice"
+                    )
+                    repeated_result = self._tool_outcome(
+                        name=action.name,
+                        arguments=action.arguments,
+                        error={
+                            "type": "RepeatedAction",
+                            "message": message,
+                        },
+                        trace_context=action_context,
+                    )
+                    stored_result = self._append_task_context(
+                        repeated_result
+                    )
+                    self._record(stored_result.copy())
+                    return self._finish(
+                        success=False,
+                        answer=(
+                            "Agent stopped because the same action made "
+                            "no page progress twice"
+                        ),
+                        token_usage=token_usage,
+                    )
+
                 if action.name in TOOL_GETTER_NAMES:
                     self._record(
                         {
                             "type": "tool_call",
-                            "browser_session_id": browser_session_id,
+                            **action_context,
                             "name": action.name,
                             "arguments": action.arguments,
                         }
@@ -379,12 +512,14 @@ class Agent:
                             name=action.name,
                             arguments=action.arguments,
                             result=group_tools,
+                            trace_context=action_context,
                         )
                     except Exception as exc:
                         outcome = self._tool_outcome(
                             name=action.name,
                             arguments=action.arguments,
-                            error=str(exc) or type(exc).__name__,
+                            error=self._error_details(exc),
+                            trace_context=action_context,
                         )
                     self._append_task_context(outcome)
                     self._record(outcome.copy())
@@ -397,33 +532,40 @@ class Agent:
                 await self._prepare_visual_action(
                     browser_session_id,
                     action,
+                    action_context,
                 )
                 try:
                     result = await self._call_tool(
                         browser_session_id=browser_session_id,
                         name=action.name,
                         arguments=action.arguments,
+                        trace_context=action_context,
+                        record_result=False,
                     )
                     outcome = self._tool_outcome(
                         name=action.name,
                         arguments=action.arguments,
                         result=result,
+                        trace_context=action_context,
                     )
                 except Exception as exc:
                     outcome = self._tool_outcome(
                         name=action.name,
                         arguments=action.arguments,
-                        error=str(exc) or type(exc).__name__,
+                        error=self._error_details(exc),
                         uncertain=(
                             requires_observation
                             and isinstance(exc, TimeoutError)
                         ),
+                        trace_context=action_context,
                     )
                     stored_outcome = self._append_task_context(outcome)
                     if requires_observation and isinstance(exc, TimeoutError):
                         pending_outcome = stored_outcome
                         pending_fingerprint = observation_fingerprint
                         observation_required = True
+                    else:
+                        self._record(stored_outcome.copy())
                     break
 
                 stored_outcome = self._append_task_context(outcome)
@@ -434,6 +576,7 @@ class Agent:
                     pending_fingerprint = observation_fingerprint
                     observation_required = True
                     break
+                self._record(stored_outcome.copy())
 
         return self._finish(
             success=False,
@@ -459,35 +602,84 @@ class Agent:
         }
         return action.model_copy(update={"arguments": arguments})
 
+    def _register_action(
+        self,
+        action: AgentAction,
+        page_fingerprint: tuple[str | None, str] | None,
+    ) -> int:
+        signature = json.dumps(
+            [action.name, action.arguments, page_fingerprint],
+            ensure_ascii=False,
+            default=str,
+            sort_keys=True,
+        )
+        if signature == self._last_action_signature:
+            self._repeated_action_count += 1
+        else:
+            self._last_action_signature = signature
+            self._repeated_action_count = 1
+        return self._repeated_action_count
+
+    @staticmethod
+    def _observation_is_empty(observation: Any) -> bool:
+        snapshot = extract_snapshot(observation)
+        if snapshot is None:
+            return True
+        normalized = snapshot.strip().lower()
+        return normalized in {
+            "",
+            "(no interactive elements)",
+            "(empty snapshot)",
+        }
+
+    @staticmethod
+    def _error_details(exc: Exception) -> dict[str, Any]:
+        serializer = getattr(exc, "as_dict", None)
+        if callable(serializer):
+            return serializer()
+        return {
+            "type": type(exc).__name__,
+            "message": str(exc) or type(exc).__name__,
+            "retryable": isinstance(exc, TimeoutError),
+        }
+
     async def _prepare_visual_action(
         self,
         browser_session_id: str,
         action: AgentAction,
+        trace_context: dict[str, str],
     ) -> None:
         """在真实操作前用一次轻量位置读取更新模拟指针。"""
-        if not self._has_browser_tool("agent_browser_eval"):
-            return
-        if await self._visual_eval(
-            browser_session_id,
-            VISUAL_OVERLAY_SCRIPT,
-        ):
-            self._visual_overlay_started = True
-
         selector = action.arguments.get("selector")
         if (
             action.name not in VISUAL_TARGET_ACTIONS
             or not isinstance(selector, str)
             or not selector
-            or not self._has_browser_tool("agent_browser_get_box")
         ):
             return
-        try:
-            raw_box = await self.browser.call_tool(
-                browser_session_id=browser_session_id,
-                name="agent_browser_get_box",
-                arguments={"selector": selector},
-            )
-        except Exception:
+        if not self._has_browser_tool("agent_browser_eval"):
+            return
+        installed = await self._visual_eval(
+            browser_session_id,
+            VISUAL_OVERLAY_SCRIPT,
+            purpose="visual_overlay_install",
+            trace_context=trace_context,
+        )
+        if not installed:
+            return
+        self._visual_overlay_started = True
+
+        if not self._has_browser_tool("agent_browser_get_box"):
+            return
+        box_succeeded, raw_box = await self._call_visual_tool(
+            browser_session_id,
+            "agent_browser_get_box",
+            {"selector": selector},
+            purpose="visual_target_box",
+            trace_arguments={"selector": selector},
+            trace_context=trace_context,
+        )
+        if not box_succeeded:
             return
         box = self._extract_visual_box(raw_box)
         if box is None:
@@ -498,16 +690,21 @@ class Agent:
         await self._visual_eval(
             browser_session_id,
             self._visual_pointer_script(x, y, clicking),
+            purpose="visual_pointer_move",
+            trace_context=trace_context,
         )
 
     async def _remove_visual_overlay(
         self,
         browser_session_id: str,
+        trace_context: dict[str, str] | None = None,
     ) -> None:
         """任务正常、失败或异常结束时都移除注入的显示层。"""
         await self._visual_eval(
             browser_session_id,
             VISUAL_OVERLAY_CLEANUP_SCRIPT,
+            purpose="visual_overlay_cleanup",
+            trace_context=trace_context,
         )
         self._visual_overlay_started = False
 
@@ -515,17 +712,83 @@ class Agent:
         self,
         browser_session_id: str,
         script: str,
+        *,
+        purpose: str,
+        trace_context: dict[str, str] | None = None,
     ) -> bool:
         """可视化是附加能力，失败不得影响 Agent 主任务。"""
-        try:
-            await self.browser.call_tool(
-                browser_session_id=browser_session_id,
-                name="agent_browser_eval",
-                arguments={"script": script},
+        succeeded, _ = await self._call_visual_tool(
+            browser_session_id,
+            "agent_browser_eval",
+            {"script": script},
+            purpose=purpose,
+            trace_arguments={"script_characters": len(script)},
+            trace_context=trace_context,
+        )
+        return succeeded
+
+    async def _call_visual_tool(
+        self,
+        browser_session_id: str,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        purpose: str,
+        trace_arguments: dict[str, Any],
+        trace_context: dict[str, str] | None = None,
+    ) -> tuple[bool, Any]:
+        """统一记录内部可视化调用，避免辅助失败成为不可见的等待。"""
+        context = dict(trace_context or {})
+        parent_action_id = context.get("action_id")
+        if parent_action_id:
+            context["action_id"] = (
+                f"{parent_action_id}:internal:{purpose}"
             )
-        except Exception:
-            return False
-        return True
+        context["browser_session_id"] = browser_session_id
+        summary = {
+            "internal": True,
+            "purpose": purpose,
+            **trace_arguments,
+        }
+        self._record(
+            {
+                "type": "tool_call",
+                **context,
+                "name": name,
+                "arguments": summary,
+            }
+        )
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        error = None
+        result = None
+        try:
+            result = await self.browser.call_tool(
+                browser_session_id=browser_session_id,
+                name=name,
+                arguments=arguments,
+            )
+        except Exception as exc:
+            error = self._error_details(exc)
+        succeeded = error is None
+        self._record(
+            {
+                "type": "tool_result",
+                **context,
+                "name": name,
+                "arguments": summary,
+                "status": "succeeded" if succeeded else "failed",
+                "data": {
+                    "duration_ms": round((loop.time() - started) * 1000)
+                },
+                "error": error,
+                "effect": {
+                    "dispatched": succeeded,
+                    "page_changed": None,
+                },
+            }
+        )
+        return succeeded, result
 
     def _has_browser_tool(self, name: str) -> bool:
         return any(tool.name == name for tool in self.browser.tools)
@@ -570,7 +833,39 @@ class Agent:
         item: dict[str, Any],
     ) -> dict[str, Any]:
         """保存当前任务的最新进度或完整工具结果，任务结束后再精简。"""
-        stored_item = self._compact_task_value(redact_value(item))
+        safe_item = redact_value(item)
+        if safe_item.get("type") == "tool_result":
+            fresh_items = [
+                existing
+                for existing in self.task_context
+                if existing.get("_fresh") is True
+            ]
+            if len(fresh_items) >= self.FRESH_RESULT_COUNT_LIMIT:
+                self._summarize_tool_result(fresh_items[0])
+            stored_item = self._compact_fresh_result_value(safe_item)
+            source_text = json.dumps(
+                safe_item.get("data"),
+                ensure_ascii=False,
+                default=str,
+                sort_keys=True,
+            )
+            retained_text = json.dumps(
+                stored_item.get("data"),
+                ensure_ascii=False,
+                default=str,
+                sort_keys=True,
+            )
+            stored_item["data_meta"] = {
+                "sha256": hashlib.sha256(
+                    source_text.encode("utf-8")
+                ).hexdigest(),
+                "source_characters": len(source_text),
+                "retained_characters": len(retained_text),
+                "truncated": len(retained_text) < len(source_text),
+            }
+            stored_item["_fresh"] = True
+        else:
+            stored_item = self._compact_task_value(safe_item)
         if stored_item.get("type") == "agent_progress":
             self.task_context[:] = [
                 existing
@@ -579,6 +874,33 @@ class Agent:
             ]
         self.task_context.append(stored_item)
         return stored_item
+
+    def _consume_fresh_results(self) -> None:
+        for item in self.task_context:
+            if item.get("_fresh") is True:
+                self._summarize_tool_result(item)
+
+    @classmethod
+    def _summarize_tool_result(cls, item: dict[str, Any]) -> None:
+        item.pop("_fresh", None)
+        data = item.get("data")
+        text = json.dumps(
+            data,
+            ensure_ascii=False,
+            default=str,
+            sort_keys=True,
+        )
+        data_meta = item.get("data_meta") or {}
+        source_characters = data_meta.get("source_characters", len(text))
+        if source_characters <= 2_000:
+            return
+        item["data"] = {
+            "sha256": data_meta.get("sha256")
+            or hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "characters": source_characters,
+            "preview": text[: cls.RESULT_SUMMARY_PREVIEW_LIMIT],
+        }
+        item["data_compacted"] = True
 
     def _llm_task_context(self) -> list[dict[str, Any]]:
         """组合当前任务页面、工具结果和最新进度。"""
@@ -765,17 +1087,39 @@ class Agent:
         return value
 
     @classmethod
+    def _compact_fresh_result_value(cls, value: Any) -> Any:
+        """保留下一轮需要的工具正文，同时移除页面树的重复副本。"""
+        if isinstance(value, str):
+            if len(value) <= cls.FRESH_RESULT_TEXT_LIMIT:
+                return value
+            suffix = "\n... [result truncated]"
+            return value[: cls.FRESH_RESULT_TEXT_LIMIT - len(suffix)] + suffix
+        if isinstance(value, dict):
+            return {
+                key: cls._compact_fresh_result_value(item)
+                for key, item in value.items()
+                if key not in {"refs", "snapshot"}
+            }
+        if isinstance(value, list):
+            return [
+                cls._compact_fresh_result_value(item)
+                for item in value[-50:]
+            ]
+        return value
+
+    @classmethod
     def _tool_outcome(
         cls,
         name: str,
         arguments: dict[str, Any],
         result: Any = None,
-        error: str | None = None,
+        error: Any = None,
         uncertain: bool = False,
+        trace_context: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """把不同 MCP 返回统一成模型可稳定判断的工具结果。"""
         if error is not None:
-            return {
+            outcome = {
                 "type": "tool_result",
                 "name": name,
                 "arguments": arguments,
@@ -787,38 +1131,41 @@ class Agent:
                     "page_changed": None,
                 },
             }
-
-        status = "succeeded"
-        data = result
-        result_error = None
-        if isinstance(result, dict):
-            if result.get("success") is False:
-                status = "failed"
-                result_error = (
-                    result.get("error")
-                    or result.get("message")
-                    or "tool reported failure"
-                )
-            if "data" in result:
-                data = result.get("data")
-            else:
-                data = {
-                    key: value
-                    for key, value in result.items()
-                    if key not in {"success", "error", "message"}
-                }
-        return {
-            "type": "tool_result",
-            "name": name,
-            "arguments": arguments,
-            "status": status,
-            "data": data,
-            "error": result_error,
-            "effect": {
-                "dispatched": status == "succeeded",
-                "page_changed": None,
-            },
-        }
+        else:
+            status = "succeeded"
+            data = result
+            result_error = None
+            if isinstance(result, dict):
+                if result.get("success") is False:
+                    status = "failed"
+                    result_error = (
+                        result.get("error")
+                        or result.get("message")
+                        or "tool reported failure"
+                    )
+                if "data" in result:
+                    data = result.get("data")
+                else:
+                    data = {
+                        key: value
+                        for key, value in result.items()
+                        if key not in {"success", "error", "message"}
+                    }
+            outcome = {
+                "type": "tool_result",
+                "name": name,
+                "arguments": arguments,
+                "status": status,
+                "data": data,
+                "error": result_error,
+                "effect": {
+                    "dispatched": status == "succeeded",
+                    "page_changed": None,
+                },
+            }
+        if trace_context:
+            outcome.update(trace_context)
+        return outcome
 
     @classmethod
     def _page_fingerprint(
@@ -874,11 +1221,14 @@ class Agent:
         browser_session_id: str,
         name: str,
         arguments: dict[str, Any],
+        trace_context: dict[str, str] | None = None,
+        record_result: bool = True,
     ) -> Any:
         """调用浏览器工具，并将完整调用过程写入 trace。"""
         self._record(
             {
                 "type": "tool_call",
+                **(trace_context or {}),
                 "browser_session_id": browser_session_id,
                 "name": name,
                 "arguments": arguments,
@@ -891,25 +1241,30 @@ class Agent:
                 arguments=arguments,
             )
         except Exception as exc:
+            if record_result:
+                self._record(
+                    {
+                        "type": "tool_result",
+                        **(trace_context or {}),
+                        "browser_session_id": browser_session_id,
+                        "name": name,
+                        "arguments": arguments,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc) or type(exc).__name__,
+                    }
+                )
+            raise
+        if record_result:
             self._record(
                 {
                     "type": "tool_result",
+                    **(trace_context or {}),
                     "browser_session_id": browser_session_id,
                     "name": name,
                     "arguments": arguments,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc) or type(exc).__name__,
+                    "result": result,
                 }
             )
-            raise
-        self._record(
-            {
-                "type": "tool_result",
-                "browser_session_id": browser_session_id,
-                "name": name,
-                "result": result,
-            }
-        )
         return result
 
     def _finish(

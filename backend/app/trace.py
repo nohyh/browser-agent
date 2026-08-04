@@ -57,11 +57,15 @@ class TraceRecorder:
     def __init__(
         self,
         trace_file: Path | None,
-        tool_outcome: Callable[..., dict[str, Any]],
+        tool_outcome: Callable[..., dict[str, Any]] | None = None,
+        event_sink: Callable[[dict[str, Any]], None] | None = None,
+        retain_events: bool = True,
     ):
         self.events: list[dict[str, Any]] = []
         self.trace_file = trace_file
         self._tool_outcome = tool_outcome
+        self.event_sink = event_sink
+        self.retain_events = retain_events
         self._last_snapshot_hash: str | None = None
         if self.trace_file is not None:
             self.trace_file.parent.mkdir(parents=True, exist_ok=True)
@@ -73,7 +77,14 @@ class TraceRecorder:
             "timestamp": datetime.now(BEIJING_TIMEZONE).isoformat(),
             **event,
         }
-        self.events.append(record)
+        if self.retain_events:
+            self.events.append(record)
+        if self.event_sink is not None:
+            # 实时轨迹只发布已经过脱敏和压缩的记录，回调异常不能打断任务。
+            try:
+                self.event_sink(record.copy())
+            except Exception:
+                pass
         if self.trace_file is not None:
             event_type = record["type"]
             if event_type == "message":
@@ -92,6 +103,8 @@ class TraceRecorder:
                 title = "LLM 输出"
             elif event_type == "token_usage":
                 title = "Token 使用"
+            elif event_type == "browser_session":
+                title = "浏览器会话"
             else:
                 title = "错误"
 
@@ -112,18 +125,18 @@ class TraceRecorder:
         if event_type == "llm_call":
             return {
                 "type": "llm_call",
+                "run_id": event.get("run_id"),
+                "step_id": event.get("step_id"),
+                "observation_id": event.get("observation_id"),
                 "browser_session_id": event.get("browser_session_id"),
                 "observation": self._snapshot_summary(
                     event.get("observation"),
                     include_preview=False,
                 ),
+                "input_metrics": event.get("input_metrics") or {},
                 "message_count": len(event.get("messages") or []),
                 "task_context": [
-                    {
-                        key: item.get(key)
-                        for key in ("name", "status")
-                        if item.get(key) is not None
-                    }
+                    self._task_context_summary(item)
                     for item in (event.get("task_context") or [])
                 ],
             }
@@ -133,6 +146,43 @@ class TraceRecorder:
 
         safe_event = redact_value(event)
         return self._compact_trace_value(safe_event)
+
+    def _task_context_summary(
+        self,
+        item: dict[str, Any],
+    ) -> dict[str, Any]:
+        keys = (
+            "type",
+            "run_id",
+            "step_id",
+            "action_id",
+            "name",
+            "status",
+            "evaluation_previous_goal",
+            "memory",
+            "next_goal",
+            "effect",
+            "error",
+            "data_meta",
+        )
+        summary = {
+            key: redact_value(item.get(key))
+            for key in keys
+            if item.get(key) is not None
+        }
+        if item.get("data") is not None:
+            data = redact_value(item["data"])
+            text = json.dumps(
+                data,
+                ensure_ascii=False,
+                default=str,
+                sort_keys=True,
+            )
+            summary["data"] = {
+                "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "characters": len(text),
+            }
+        return self._compact_trace_value(summary)
 
     def _prepare_tool_result_trace(
         self,
@@ -145,6 +195,8 @@ class TraceRecorder:
             error = event.get("error")
             effect = event.get("effect")
         elif "result" in event:
+            if self._tool_outcome is None:
+                raise RuntimeError("tool_outcome is required for tool results")
             outcome = self._tool_outcome(
                 name=str(event.get("name", "")),
                 arguments=event.get("arguments") or {},
@@ -175,6 +227,9 @@ class TraceRecorder:
 
         normalized = {
             "type": "tool_result",
+            "run_id": event.get("run_id"),
+            "step_id": event.get("step_id"),
+            "action_id": event.get("action_id"),
             "browser_session_id": event.get("browser_session_id"),
             "name": event.get("name"),
             "arguments": event.get("arguments") or {},
@@ -183,6 +238,8 @@ class TraceRecorder:
             "error": structured_error,
             "effect": effect,
         }
+        if event.get("data_meta") is not None:
+            normalized["data_meta"] = event["data_meta"]
         normalized = redact_value(normalized)
         if event.get("name") == "agent_browser_snapshot":
             normalized["data"] = self._snapshot_summary(
