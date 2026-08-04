@@ -11,6 +11,7 @@ from typing import Any, Protocol
 from pydantic import Field, ValidationError, field_validator
 
 from app.models import AgentAction, AgentDecision
+from app.utils.errors import is_transient_error
 
 
 class _ProviderAgentAction(AgentAction):
@@ -172,7 +173,7 @@ class OpenAIResponsesAdapter:
                 )
             except Exception as exc:
                 network_failures += 1
-                if attempt == 0 and _is_transient_error(exc):
+                if attempt == 0 and is_transient_error(exc):
                     continue
                 raise ProviderOutputError(
                     _validation_error_kind(validation_error),
@@ -322,14 +323,6 @@ def _validation_error_kind(exc: Exception) -> str:
     ):
         return "invalid_json"
     return "schema_validation"
-
-
-def _is_transient_error(exc: Exception) -> bool:
-    return (
-        type(exc).__name__ in {"APIConnectionError", "APITimeoutError"}
-        or getattr(exc, "status_code", None)
-        in {408, 429, 500, 502, 503, 504}
-    )
 
 
 def _output_diagnostics(

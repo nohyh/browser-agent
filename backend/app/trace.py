@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from app.utils.values import compact_value, extract_snapshot
+
 
 SENSITIVE_KEYS = {
     "authorization",
@@ -22,18 +24,6 @@ SENSITIVE_QUERY_PATTERN = re.compile(
     r"jsc_orig_r|solution|token)=)[^&#\s\"']+"
 )
 BEIJING_TIMEZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")
-
-
-def extract_snapshot(value: Any) -> str | None:
-    if isinstance(value, dict):
-        snapshot = value.get("snapshot")
-        if isinstance(snapshot, str):
-            return snapshot
-        for key in ("data", "response"):
-            found = extract_snapshot(value.get(key))
-            if found is not None:
-                return found
-    return None
 
 
 def redact_value(value: Any) -> Any:
@@ -101,6 +91,8 @@ class TraceRecorder:
                 title = "LLM 输入"
             elif event_type == "llm_result":
                 title = "LLM 输出"
+            elif event_type == "llm_attempt":
+                title = "LLM 尝试"
             elif event_type == "token_usage":
                 title = "Token 使用"
             elif event_type == "browser_session":
@@ -129,6 +121,9 @@ class TraceRecorder:
                 "step_id": event.get("step_id"),
                 "observation_id": event.get("observation_id"),
                 "browser_session_id": event.get("browser_session_id"),
+                "endpoint_id": event.get("endpoint_id"),
+                "model": event.get("model"),
+                "timeout_seconds": event.get("timeout_seconds"),
                 "observation": self._snapshot_summary(
                     event.get("observation"),
                     include_preview=False,
@@ -300,18 +295,9 @@ class TraceRecorder:
 
     @classmethod
     def _compact_trace_value(cls, value: Any) -> Any:
-        if isinstance(value, str):
-            if len(value) <= 4_000:
-                return value
-            return value[:3_970] + "\n... [trace truncated]"
-        if isinstance(value, dict):
-            return {
-                key: cls._compact_trace_value(item)
-                for key, item in value.items()
-            }
-        if isinstance(value, list):
-            return [
-                cls._compact_trace_value(item)
-                for item in value[-20:]
-            ]
-        return value
+        return compact_value(
+            value,
+            string_limit=4_000,
+            list_limit=20,
+            label="trace",
+        )

@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
-from typing import TYPE_CHECKING, Any
-
-from openai import APIConnectionError, APITimeoutError
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from app.llm_provider import OpenAIResponsesAdapter, ProviderAdapter
 from app.models import AgentDecision, AgentTokenUsage
 from app.trace import redact_value
+from app.utils.errors import is_transient_error
 from app.utils.tools import format_mcp_tools
+from app.utils.values import compact_value
 
 if TYPE_CHECKING:
     from openai import AsyncOpenAI
@@ -124,6 +125,8 @@ blocked 的最终答案必须说明任务尚未完成、阻塞证据、已有结
 </输出规则>
 """.strip()
 
+LLM_REQUEST_TIMEOUT_SECONDS = 30
+
 
 class AgentLLMCallError(RuntimeError):
     """携带失败调用观测数据，同时保留底层异常类型和消息。"""
@@ -138,6 +141,18 @@ class AgentLLMCallError(RuntimeError):
         self.details = getattr(cause, "details", None)
         self.token_usage = token_usage
         super().__init__(str(cause) or self.error_type)
+
+
+class LLMRequestTimeout(TimeoutError):
+    """单次 LLM 决策超过应用截止时间。"""
+
+    error_type = "llm_request_timeout"
+
+    def __init__(self, timeout_seconds: float):
+        self.timeout_seconds = timeout_seconds
+        super().__init__(
+            f"LLM request timed out after {timeout_seconds:g} seconds"
+        )
 
 
 class AgentLLM:
@@ -156,9 +171,15 @@ class AgentLLM:
         client: AsyncOpenAI,
         model: str,
         provider_adapter: ProviderAdapter | None = None,
+        endpoint_id: str = "default",
+        request_timeout_seconds: float = LLM_REQUEST_TIMEOUT_SECONDS,
     ):
+        if request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be positive")
         self.client = client
         self.model = model
+        self.endpoint_id = endpoint_id
+        self.request_timeout_seconds = request_timeout_seconds
         self.provider_adapter = (
             provider_adapter or OpenAIResponsesAdapter(client)
         )
@@ -170,6 +191,7 @@ class AgentLLM:
         task_context: list[dict[str, Any]],
         tools: list[Any],
         conversation_summary: str | None = None,
+        attempt_sink: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[AgentDecision, AgentTokenUsage | None]:
         """构造本轮决策提示词、调用底层客户端并校验结构化结果，返回决策与 Token 消耗。"""
         task_context_text = (
@@ -205,9 +227,14 @@ class AgentLLM:
                 for message in input_messages
             )
             try:
-                provider_result = await self.provider_adapter.decide(
-                    model=self.model,
-                    input_messages=input_messages,
+                provider_result = await self._run_attempt(
+                    lambda: self.provider_adapter.decide(
+                        model=self.model,
+                        input_messages=input_messages,
+                    ),
+                    attempt=attempt_count,
+                    operation="decision",
+                    attempt_sink=attempt_sink,
                 )
                 response = provider_result.raw_response
                 provider_calls = provider_result.llm_calls
@@ -238,10 +265,7 @@ class AgentLLM:
                     ),
                 )
             except Exception as exc:
-                if (
-                    attempt == 0
-                    and self._is_transient_error(exc)
-                ):
+                if attempt == 0 and self._is_transient_error(exc):
                     continue
                 raise self._failed_call_error(
                     exc,
@@ -251,14 +275,86 @@ class AgentLLM:
                 ) from exc
         raise RuntimeError("unreachable")
 
+    async def _run_attempt(
+        self,
+        operation_call: Callable[[], Awaitable[Any]],
+        *,
+        attempt: int,
+        operation: str,
+        attempt_sink: Callable[[dict[str, Any]], None] | None,
+    ) -> Any:
+        """统一执行、限时并记录一次真实 LLM 请求。"""
+        attempt_base = {
+            "endpoint_id": self.endpoint_id,
+            "model": self.model,
+            "operation": operation,
+            "attempt": attempt,
+            "max_attempts": 2,
+            "timeout_seconds": self.request_timeout_seconds,
+        }
+        self._emit_attempt(
+            attempt_sink,
+            {**attempt_base, "status": "running"},
+        )
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        status = "succeeded"
+        error: Exception | None = None
+        try:
+            try:
+                return await asyncio.wait_for(
+                    operation_call(),
+                    timeout=self.request_timeout_seconds,
+                )
+            except TimeoutError as exc:
+                raise LLMRequestTimeout(
+                    self.request_timeout_seconds
+                ) from exc
+        except asyncio.CancelledError:
+            status = "cancelled"
+            raise
+        except Exception as exc:
+            error = exc
+            status = (
+                "timed_out"
+                if isinstance(exc, LLMRequestTimeout)
+                else "failed"
+            )
+            raise
+        finally:
+            event = {
+                **attempt_base,
+                "status": status,
+                "duration_ms": round((loop.time() - started) * 1000),
+            }
+            if error is not None:
+                event["error"] = {
+                    "type": getattr(
+                        error,
+                        "error_type",
+                        type(error).__name__,
+                    ),
+                    "message": str(error) or type(error).__name__,
+                }
+            self._emit_attempt(attempt_sink, event)
+
     @staticmethod
     def _is_transient_error(exc: Exception) -> bool:
         """连接波动、超时和可恢复 HTTP 状态只额外尝试一次。"""
-        return (
-            isinstance(exc, (APIConnectionError, APITimeoutError))
-            or getattr(exc, "status_code", None)
-            in {408, 429, 500, 502, 503, 504}
-        )
+        return isinstance(exc, LLMRequestTimeout) or is_transient_error(exc)
+
+    @staticmethod
+    def _emit_attempt(
+        sink: Callable[[dict[str, Any]], None] | None,
+        event: dict[str, Any],
+    ) -> None:
+        if sink is None:
+            return
+        try:
+            sink(event)
+        except Exception:
+            # 诊断写入失败不能改变 LLM 调用结果。
+            pass
 
     @classmethod
     def _failed_call_error(
@@ -314,6 +410,7 @@ class AgentLLM:
         self,
         previous_summary: str | None,
         messages: list[dict[str, str]],
+        attempt_sink: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[str, AgentTokenUsage | None]:
         """把较早完整对话轮次压缩为唯一的会话历史摘要。"""
         history_payload = {
@@ -343,10 +440,26 @@ class AgentLLM:
                 ),
             },
         ]
-        response = await self.client.responses.create(
-            model=self.model,
-            input=input_messages,
-        )
+        response = None
+        attempt_count = 0
+        for attempt in range(2):
+            attempt_count = attempt + 1
+            try:
+                response = await self._run_attempt(
+                    lambda: self.client.responses.create(
+                        model=self.model,
+                        input=input_messages,
+                    ),
+                    attempt=attempt_count,
+                    operation="conversation_compaction",
+                    attempt_sink=attempt_sink,
+                )
+                break
+            except Exception as exc:
+                if attempt == 0 and self._is_transient_error(exc):
+                    continue
+                raise
+        assert response is not None
         summary = (response.output_text or "").strip()
         if not summary:
             raise ValueError(
@@ -361,9 +474,15 @@ class AgentLLM:
             summary,
             self._extract_token_usage(
                 response,
+                llm_calls=attempt_count,
+                failed_llm_calls=attempt_count - 1,
+                usage_unavailable_calls=(
+                    attempt_count - 1 + int(response.usage is None)
+                ),
                 input_characters=sum(
                     len(message["content"]) for message in input_messages
-                ),
+                )
+                * attempt_count,
             ),
         )
 
@@ -713,28 +832,13 @@ class AgentLLM:
         list_limit: int = 20,
     ) -> Any:
         """限制上下文字段体积，并剔除页面树的重复副本。"""
-        if isinstance(value, str):
-            return cls._truncate_text(value, string_limit, "text")
-        if isinstance(value, dict):
-            return {
-                key: cls._compact_value(
-                    item,
-                    string_limit=string_limit,
-                    list_limit=list_limit,
-                )
-                for key, item in value.items()
-                if key not in {"refs", "snapshot"}
-            }
-        if isinstance(value, list):
-            return [
-                cls._compact_value(
-                    item,
-                    string_limit=string_limit,
-                    list_limit=list_limit,
-                )
-                for item in value[-list_limit:]
-            ]
-        return value
+        return compact_value(
+            value,
+            string_limit=string_limit,
+            list_limit=list_limit,
+            exclude_keys={"refs", "snapshot"},
+            label="text",
+        )
 
     @staticmethod
     def _truncate_text(text: str, limit: int, label: str) -> str:

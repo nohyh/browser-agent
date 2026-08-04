@@ -1,0 +1,209 @@
+:root {
+  color-scheme: light dark;
+  font-family:
+    "Segoe UI Variable Text",
+    "Segoe UI",
+    "Microsoft YaHei UI",
+    ui-sans-serif,
+    system-ui,
+    sans-serif;
+  font-synthesis: none;
+  text-rendering: auto;
+  --font-display:
+    "Iowan Old Style",
+    "Palatino Linotype",
+    "Songti SC",
+    "STSong",
+    serif;
+  --canvas: #faf9f5;
+  --surface-soft: #f5f0e8;
+  --surface-card: #eee8de;
+  --surface-strong: #e5ddd2;
+  --ink: #191816;
+  --body: #3f3c38;
+  --muted: #706b64;
+  --muted-soft: #8a847b;
+  --hairline: #e5ded4;
+  --hairline-strong: #cec4b8;
+  --coral: #b96347;
+  --coral-hover: #9f5037;
+  --coral-soft: #f1dfd7;
+  --on-coral: #fffaf6;
+  --danger: #a53c39;
+  --danger-soft: #f5e4e1;
+  --overlay: rgb(34 29 25 / 0.28);
+  --drawer-shadow: 18px 0 44px rgb(58 45 35 / 0.14);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  min-width: 300px;
+  height: 100%;
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+  background: var(--canvas);
+  color: var(--ink);
+  font-size: 14px;
+}
+
+button,
+input,
+textarea {
+  color: inherit;
+  font: inherit;
+}
+
+button {
+  border: 0;
+}
+
+button:not(:disabled) {
+  cursor: pointer;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--coral);
+  outline-offset: 2px;
+}
+
+button:disabled,
+input:disabled,
+textarea:disabled {
+  cursor: not-allowed;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.app-shell {
+  position: relative;
+  display: grid;
+  width: 100%;
+  min-height: 100dvh;
+  grid-template-rows: 58px minmax(0, 1fr);
+  overflow: hidden;
+  background: var(--canvas);
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 9px 8px 12px;
+  border-bottom: 1px solid var(--hairline);
+  background: color-mix(in srgb, var(--canvas) 96%, transparent);
+}
+
+.brand-button {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 9px;
+  padding: 0;
+  background: transparent;
+  text-align: left;
+}
+
+.brand-logo,
+.assistant-avatar {
+  display: block;
+  flex: 0 0 auto;
+  overflow: hidden;
+  border: 1px solid var(--hairline-strong);
+  background: var(--surface-soft);
+}
+
+.brand-logo {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+}
+
+.brand-logo img,
+.assistant-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: 50% 36%;
+  transform: scale(1.72);
+}
+
+.brand-button strong {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 13.5px;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+}
+
+.icon-button {
+  display: inline-grid;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--muted);
+  transition:
+    background-color 140ms ease,
+    color 140ms ease,
+    transform 140ms ease;
+}
+
+.icon-button:hover,
+.icon-button.is-active {
+  background: var(--surface-card);
+  color: var(--ink);
+}
+
+.icon-button.is-active {
+  box-shadow: inset 0 0 0 1px var(--hairline-strong);
+}
+
+.icon-button:active {
+  transform: translateY(1px);
+}
+
+.view-stack {
+  position: relative;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.view {
+  position: absolute;
+  inset: 0;
+  min-height: 0;
+  animation: view-enter 160ms ease-out;
+}
+

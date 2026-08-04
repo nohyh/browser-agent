@@ -8,20 +8,23 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.llm import AgentLLM
-from app.mcp_client import BrowserService, VISUAL_OVERLAY_CLEANUP_SCRIPT
+from app.browser.visual import BrowserVisualController
+from app.mcp_client import BrowserService
 from app.models import (
     AgentAction,
     AgentDecision,
     AgentResult,
     AgentTokenUsage,
 )
-from app.trace import TraceRecorder, extract_snapshot, redact_value
+from app.trace import TraceRecorder, redact_value
+from app.utils.errors import exception_details
 from app.utils.tools import (
     REGISTERED_TOOL_NAMES,
     TOOL_GETTER_NAMES,
     get_tool_group,
     select_mcp_tools_for_llm,
 )
+from app.utils.values import compact_value, extract_snapshot
 
 
 OBSERVATION_REQUIRED_ACTIONS = {
@@ -66,125 +69,6 @@ ATTRIBUTE_REF_SELECTOR_PATTERN = re.compile(
     r"""^\s*\[\s*ref\s*=\s*['"]?(e\d+)['"]?\s*\]\s*$""",
     re.IGNORECASE,
 )
-VISUAL_TARGET_ACTIONS = {
-    "agent_browser_click",
-    "agent_browser_dblclick",
-    "agent_browser_fill",
-    "agent_browser_type",
-    "agent_browser_focus",
-    "agent_browser_hover",
-    "agent_browser_press",
-    "agent_browser_check",
-    "agent_browser_uncheck",
-    "agent_browser_select",
-}
-VISUAL_CLICK_ACTIONS = {
-    "agent_browser_click",
-    "agent_browser_dblclick",
-    "agent_browser_check",
-    "agent_browser_uncheck",
-    "agent_browser_select",
-}
-VISUAL_OVERLAY_SCRIPT = r"""
-(() => {
-  const layerId = 'browser-agent-visual-layer';
-  const existing = document.getElementById(layerId);
-  if (existing && window.__browserAgentVisual) return true;
-  if (existing) existing.remove();
-
-  const host = document.createElement('div');
-  host.id = layerId;
-  host.setAttribute('aria-hidden', 'true');
-  Object.assign(host.style, {
-    position: 'fixed',
-    inset: '0',
-    zIndex: '2147483647',
-    pointerEvents: 'none',
-    contain: 'strict'
-  });
-
-  const root = host.attachShadow({ mode: 'open' });
-  root.innerHTML = `
-    <style>
-      :host { all: initial; }
-      .edge {
-        position: fixed;
-        inset: 0;
-        border-radius: 6px;
-        box-shadow:
-          inset 0 0 0 1px rgba(226, 109, 90, .52),
-          inset 0 0 22px rgba(226, 109, 90, .16);
-        animation: browser-agent-edge-pulse 2.4s ease-in-out infinite;
-      }
-      .cursor {
-        position: fixed;
-        left: 0;
-        top: 0;
-        width: 20px;
-        height: 24px;
-        opacity: 0;
-        transform: translate3d(-32px, -32px, 0);
-        transition: transform 180ms cubic-bezier(.2,.8,.2,1), opacity 120ms ease;
-        will-change: transform;
-      }
-      .cursor::before {
-        content: '';
-        position: absolute;
-        inset: 0;
-        background: #fff;
-        clip-path: polygon(0 0, 0 20px, 5px 15px, 9px 24px, 13px 22px, 9px 14px, 17px 14px);
-        filter: drop-shadow(0 1px 1px rgba(20, 18, 16, .75));
-      }
-      .cursor::after {
-        content: '';
-        position: absolute;
-        left: -10px;
-        top: -10px;
-        width: 38px;
-        height: 38px;
-        border: 1.5px solid rgba(226, 109, 90, .82);
-        border-radius: 50%;
-        opacity: 0;
-        transform: scale(.35);
-      }
-      .cursor.is-clicking::after {
-        animation: browser-agent-click 420ms ease-out;
-      }
-      @keyframes browser-agent-edge-pulse {
-        0%, 100% { opacity: .65; }
-        50% { opacity: 1; }
-      }
-      @keyframes browser-agent-click {
-        0% { opacity: .9; transform: scale(.35); }
-        100% { opacity: 0; transform: scale(1.15); }
-      }
-      @media (prefers-reduced-motion: reduce) {
-        .edge { animation: none; }
-        .cursor { transition: none; }
-      }
-    </style>
-    <div class="edge"></div>
-    <div class="cursor"></div>
-  `;
-  (document.documentElement || document.body).appendChild(host);
-
-  const cursor = root.querySelector('.cursor');
-  window.__browserAgentVisual = {
-    host,
-    cursor,
-    move(x, y, clicking) {
-      cursor.style.opacity = '1';
-      cursor.style.transform = `translate3d(${x}px, ${y}px, 0)`;
-      cursor.classList.remove('is-clicking');
-      if (clicking) {
-        void cursor.offsetWidth;
-        cursor.classList.add('is-clicking');
-      }
-    }
-  };
-  return true;
-})()
-"""
 class Agent:
     """负责观察页面、请求 LLM 决策并执行浏览器动作。"""
 
@@ -219,9 +103,9 @@ class Agent:
         )
         self._record({"type": "message", **initial_message})
         self.browser = browser
+        self.visual = BrowserVisualController(browser, self._record)
         self.llm = llm
         self.max_steps = max_steps
-        self._visual_overlay_started = False
         self._run_count = 0
         self._last_action_signature: str | None = None
         self._repeated_action_count = 0
@@ -255,7 +139,7 @@ class Agent:
 
     async def run(self, browser_session_id: str) -> AgentResult:
         """循环执行“观察、决策、动作”，直到完成或达到最大步数。"""
-        self._visual_overlay_started = False
+        self.visual.reset()
         self._last_action_signature = None
         self._repeated_action_count = 0
         self._run_count += 1
@@ -263,8 +147,8 @@ class Agent:
         try:
             return await self._run_loop(browser_session_id, run_id)
         finally:
-            if self._visual_overlay_started:
-                await self._remove_visual_overlay(
+            if self.visual.started:
+                await self.visual.remove(
                     browser_session_id,
                     {
                         "run_id": run_id,
@@ -285,7 +169,10 @@ class Agent:
         observation_required = True
         pending_outcome: dict[str, Any] | None = None
         pending_fingerprint: tuple[str | None, str] | None = None
-        token_usage = await self._maybe_compact_conversation()
+        token_usage = await self._maybe_compact_conversation(
+            browser_session_id,
+            run_id,
+        )
 
         for step_number in range(1, self.max_steps + 1):
             step_id = f"{run_id}:step-{step_number}"
@@ -362,6 +249,9 @@ class Agent:
                         "messages": llm_messages,
                         "task_context": llm_task_context,
                         "input_metrics": input_metrics,
+                        "endpoint_id": self.llm.endpoint_id,
+                        "model": self.llm.model,
+                        "timeout_seconds": self.llm.request_timeout_seconds,
                     }
                 )
                 # 调用 LLM 获取下一步动作决策及本轮 Token 消耗
@@ -371,6 +261,16 @@ class Agent:
                     task_context=llm_task_context,
                     tools=visible_tools,
                     conversation_summary=self._conversation_summary,
+                    attempt_sink=lambda event: self._record(
+                        {
+                            "type": "llm_attempt",
+                            "run_id": run_id,
+                            "step_id": step_id,
+                            "observation_id": observation_id,
+                            "browser_session_id": browser_session_id,
+                            **event,
+                        }
+                    ),
                 )
                 if call_usage is not None:
                     token_usage = (
@@ -382,6 +282,8 @@ class Agent:
                     "type": "llm_result",
                     "run_id": run_id,
                     "step_id": step_id,
+                    "endpoint_id": self.llm.endpoint_id,
+                    "model": self.llm.model,
                     "output": decision.model_dump(),
                 }
                 if call_usage is not None:
@@ -518,7 +420,7 @@ class Agent:
                         outcome = self._tool_outcome(
                             name=action.name,
                             arguments=action.arguments,
-                            error=self._error_details(exc),
+                            error=exception_details(exc),
                             trace_context=action_context,
                         )
                     self._append_task_context(outcome)
@@ -529,7 +431,7 @@ class Agent:
                 requires_observation = (
                     action.name in OBSERVATION_REQUIRED_ACTIONS
                 )
-                await self._prepare_visual_action(
+                await self.visual.prepare(
                     browser_session_id,
                     action,
                     action_context,
@@ -552,7 +454,7 @@ class Agent:
                     outcome = self._tool_outcome(
                         name=action.name,
                         arguments=action.arguments,
-                        error=self._error_details(exc),
+                        error=exception_details(exc),
                         uncertain=(
                             requires_observation
                             and isinstance(exc, TimeoutError)
@@ -631,202 +533,6 @@ class Agent:
             "(no interactive elements)",
             "(empty snapshot)",
         }
-
-    @staticmethod
-    def _error_details(exc: Exception) -> dict[str, Any]:
-        serializer = getattr(exc, "as_dict", None)
-        if callable(serializer):
-            return serializer()
-        return {
-            "type": type(exc).__name__,
-            "message": str(exc) or type(exc).__name__,
-            "retryable": isinstance(exc, TimeoutError),
-        }
-
-    async def _prepare_visual_action(
-        self,
-        browser_session_id: str,
-        action: AgentAction,
-        trace_context: dict[str, str],
-    ) -> None:
-        """在真实操作前用一次轻量位置读取更新模拟指针。"""
-        selector = action.arguments.get("selector")
-        if (
-            action.name not in VISUAL_TARGET_ACTIONS
-            or not isinstance(selector, str)
-            or not selector
-        ):
-            return
-        if not self._has_browser_tool("agent_browser_eval"):
-            return
-        installed = await self._visual_eval(
-            browser_session_id,
-            VISUAL_OVERLAY_SCRIPT,
-            purpose="visual_overlay_install",
-            trace_context=trace_context,
-        )
-        if not installed:
-            return
-        self._visual_overlay_started = True
-
-        if not self._has_browser_tool("agent_browser_get_box"):
-            return
-        box_succeeded, raw_box = await self._call_visual_tool(
-            browser_session_id,
-            "agent_browser_get_box",
-            {"selector": selector},
-            purpose="visual_target_box",
-            trace_arguments={"selector": selector},
-            trace_context=trace_context,
-        )
-        if not box_succeeded:
-            return
-        box = self._extract_visual_box(raw_box)
-        if box is None:
-            return
-        x = box["x"] + box["width"] / 2
-        y = box["y"] + box["height"] / 2
-        clicking = action.name in VISUAL_CLICK_ACTIONS
-        await self._visual_eval(
-            browser_session_id,
-            self._visual_pointer_script(x, y, clicking),
-            purpose="visual_pointer_move",
-            trace_context=trace_context,
-        )
-
-    async def _remove_visual_overlay(
-        self,
-        browser_session_id: str,
-        trace_context: dict[str, str] | None = None,
-    ) -> None:
-        """任务正常、失败或异常结束时都移除注入的显示层。"""
-        await self._visual_eval(
-            browser_session_id,
-            VISUAL_OVERLAY_CLEANUP_SCRIPT,
-            purpose="visual_overlay_cleanup",
-            trace_context=trace_context,
-        )
-        self._visual_overlay_started = False
-
-    async def _visual_eval(
-        self,
-        browser_session_id: str,
-        script: str,
-        *,
-        purpose: str,
-        trace_context: dict[str, str] | None = None,
-    ) -> bool:
-        """可视化是附加能力，失败不得影响 Agent 主任务。"""
-        succeeded, _ = await self._call_visual_tool(
-            browser_session_id,
-            "agent_browser_eval",
-            {"script": script},
-            purpose=purpose,
-            trace_arguments={"script_characters": len(script)},
-            trace_context=trace_context,
-        )
-        return succeeded
-
-    async def _call_visual_tool(
-        self,
-        browser_session_id: str,
-        name: str,
-        arguments: dict[str, Any],
-        *,
-        purpose: str,
-        trace_arguments: dict[str, Any],
-        trace_context: dict[str, str] | None = None,
-    ) -> tuple[bool, Any]:
-        """统一记录内部可视化调用，避免辅助失败成为不可见的等待。"""
-        context = dict(trace_context or {})
-        parent_action_id = context.get("action_id")
-        if parent_action_id:
-            context["action_id"] = (
-                f"{parent_action_id}:internal:{purpose}"
-            )
-        context["browser_session_id"] = browser_session_id
-        summary = {
-            "internal": True,
-            "purpose": purpose,
-            **trace_arguments,
-        }
-        self._record(
-            {
-                "type": "tool_call",
-                **context,
-                "name": name,
-                "arguments": summary,
-            }
-        )
-        loop = asyncio.get_running_loop()
-        started = loop.time()
-        error = None
-        result = None
-        try:
-            result = await self.browser.call_tool(
-                browser_session_id=browser_session_id,
-                name=name,
-                arguments=arguments,
-            )
-        except Exception as exc:
-            error = self._error_details(exc)
-        succeeded = error is None
-        self._record(
-            {
-                "type": "tool_result",
-                **context,
-                "name": name,
-                "arguments": summary,
-                "status": "succeeded" if succeeded else "failed",
-                "data": {
-                    "duration_ms": round((loop.time() - started) * 1000)
-                },
-                "error": error,
-                "effect": {
-                    "dispatched": succeeded,
-                    "page_changed": None,
-                },
-            }
-        )
-        return succeeded, result
-
-    def _has_browser_tool(self, name: str) -> bool:
-        return any(tool.name == name for tool in self.browser.tools)
-
-    @classmethod
-    def _extract_visual_box(
-        cls,
-        value: Any,
-    ) -> dict[str, float] | None:
-        if isinstance(value, dict):
-            keys = ("x", "y", "width", "height")
-            if all(
-                isinstance(value.get(key), (int, float))
-                and not isinstance(value.get(key), bool)
-                for key in keys
-            ):
-                return {key: float(value[key]) for key in keys}
-            for nested in value.values():
-                box = cls._extract_visual_box(nested)
-                if box is not None:
-                    return box
-        return None
-
-    @staticmethod
-    def _visual_pointer_script(
-        x: float,
-        y: float,
-        clicking: bool,
-    ) -> str:
-        click_literal = "true" if clicking else "false"
-        return f"""
-(() => {{
-  const visual = window.__browserAgentVisual;
-  if (!visual || !visual.cursor) return false;
-  visual.move({x:.1f}, {y:.1f}, {click_literal});
-  return true;
-}})()
-"""
 
     def _append_task_context(
         self,
@@ -924,6 +630,8 @@ class Agent:
 
     async def _maybe_compact_conversation(
         self,
+        browser_session_id: str,
+        run_id: str,
     ) -> AgentTokenUsage | None:
         """对话过长时压缩较早完整轮次，同时保留原始消息供展示。"""
         if self._conversation_compaction_attempted:
@@ -960,6 +668,15 @@ class Agent:
             summary, usage = await self.llm.compact_conversation_history(
                 previous_summary=self._conversation_summary,
                 messages=old_messages,
+                attempt_sink=lambda event: self._record(
+                    {
+                        "type": "llm_attempt",
+                        "run_id": run_id,
+                        "step_id": f"{run_id}:conversation-compaction",
+                        "browser_session_id": browser_session_id,
+                        **event,
+                    }
+                ),
             )
         except Exception as exc:
             self._record(
@@ -1069,43 +786,22 @@ class Agent:
     @classmethod
     def _compact_task_value(cls, value: Any) -> Any:
         """在进入内存上下文前限制工具正文，避免大结果占满进程内存。"""
-        if isinstance(value, str):
-            if len(value) <= 4_000:
-                return value
-            return value[:3_970] + "\n... [result truncated]"
-        if isinstance(value, dict):
-            return {
-                key: cls._compact_task_value(item)
-                for key, item in value.items()
-                if key not in {"refs", "snapshot"}
-            }
-        if isinstance(value, list):
-            return [
-                cls._compact_task_value(item)
-                for item in value[-20:]
-            ]
-        return value
+        return compact_value(
+            value,
+            string_limit=4_000,
+            list_limit=20,
+            exclude_keys={"refs", "snapshot"},
+        )
 
     @classmethod
     def _compact_fresh_result_value(cls, value: Any) -> Any:
         """保留下一轮需要的工具正文，同时移除页面树的重复副本。"""
-        if isinstance(value, str):
-            if len(value) <= cls.FRESH_RESULT_TEXT_LIMIT:
-                return value
-            suffix = "\n... [result truncated]"
-            return value[: cls.FRESH_RESULT_TEXT_LIMIT - len(suffix)] + suffix
-        if isinstance(value, dict):
-            return {
-                key: cls._compact_fresh_result_value(item)
-                for key, item in value.items()
-                if key not in {"refs", "snapshot"}
-            }
-        if isinstance(value, list):
-            return [
-                cls._compact_fresh_result_value(item)
-                for item in value[-50:]
-            ]
-        return value
+        return compact_value(
+            value,
+            string_limit=cls.FRESH_RESULT_TEXT_LIMIT,
+            list_limit=50,
+            exclude_keys={"refs", "snapshot"},
+        )
 
     @classmethod
     def _tool_outcome(

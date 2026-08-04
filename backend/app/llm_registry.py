@@ -26,7 +26,11 @@ class LLMEndpointRecord:
             )
         llm = self.llms.get(model)
         if llm is None:
-            llm = AgentLLM(self.client, model=model)
+            llm = AgentLLM(
+                self.client,
+                model=model,
+                endpoint_id=self.endpoint_id,
+            )
             self.llms[model] = llm
         return llm
 

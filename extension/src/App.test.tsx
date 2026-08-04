@@ -124,6 +124,22 @@ async function createConversation(
 }
 
 describe('Browser Agent 侧边栏', () => {
+  it('把领域模型、服务和页面组件拆到独立模块', async () => {
+    const [{ ApiError }, models, storage, chat, settings] = await Promise.all([
+      import('./lib/api'),
+      import('./lib/models'),
+      import('./lib/storage'),
+      import('./components/ChatView'),
+      import('./components/SettingsView'),
+    ]);
+
+    expect(ApiError).toBeTypeOf('function');
+    expect(models.DEFAULT_MODEL_SETTINGS).toBeDefined();
+    expect(storage.readModelSettings).toBeTypeOf('function');
+    expect(chat.ChatView).toBeTypeOf('function');
+    expect(settings.SettingsView).toBeTypeOf('function');
+  });
+
   it('打开后分析当前页面并把点击的建议填入聊天框', async () => {
     const user = userEvent.setup();
     const chromeMock = mockCurrentPage({

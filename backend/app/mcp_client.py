@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from mcp import ClientSession
 
+from app.browser.visual import VISUAL_OVERLAY_CLEANUP_SCRIPT
 from app.browser_process import (
     get_chrome_cdp_candidates,
     run_agent_browser_cli,
@@ -35,16 +36,6 @@ RUNTIME_DISCONNECT_MARKERS = (
     "session is not active",
     "no active page",
 )
-VISUAL_OVERLAY_CLEANUP_SCRIPT = r"""
-(() => {
-  const host = document.getElementById('browser-agent-visual-layer');
-  if (host) host.remove();
-  delete window.__browserAgentVisual;
-  return true;
-})()
-"""
-
-
 class BrowserToolTimeout(TimeoutError):
     """可被 Agent 和 API 稳定识别的 MCP 工具超时。"""
 
@@ -383,6 +374,7 @@ class BrowserService:
         origin = f"{scheme}://{parsed.hostname}:{parsed.port}"
         with request.urlopen(f"{origin}/json/list", timeout=2) as response:
             targets = json.loads(response.read().decode("utf-8"))
+        internal_ids: set[str] = set()
         for target in targets if isinstance(targets, list) else []:
             if not isinstance(target, dict):
                 continue
@@ -394,19 +386,12 @@ class BrowserService:
                 and url.startswith("chrome://newtab")
                 and isinstance(target_id, str)
             ):
+                internal_ids.add(target_id)
                 with request.urlopen(
                     f"{origin}/json/close/{quote(target_id, safe='')}",
                     timeout=2,
                 ):
                     pass
-        internal_ids = {
-            target.get("id")
-            for target in targets if isinstance(targets, list)
-            if isinstance(target, dict)
-            and target.get("type") == "page"
-            and isinstance(target.get("url"), str)
-            and target["url"].startswith("chrome://newtab")
-        }
         if not internal_ids:
             return
         # /json/close 是异步关闭，短轮询确认 target 真正消失后再报告 ready。
