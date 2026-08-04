@@ -416,6 +416,52 @@ describe('Browser Agent 侧边栏', () => {
     expect(within(dialog).getByText('提取当前页面标题')).toBeInTheDocument();
   });
 
+  it('未发送消息的新会话不会保存或出现在历史中', async () => {
+    const user = userEvent.setup();
+    const storage = mockChromeStorage({
+      chatSessions: [
+        {
+          id: 'empty-session',
+          title: '空白会话',
+          createdAt: 1,
+          updatedAt: 1,
+          messages: [],
+        },
+        {
+          id: 'saved-session',
+          title: '已有会话',
+          createdAt: 2,
+          updatedAt: 2,
+          messages: [{ id: 'm1', role: 'user', content: '已有消息' }],
+        },
+      ],
+    });
+    mockHealthyBackend();
+    render(<App />);
+
+    await user.click(screen.getByRole('button', { name: '打开会话' }));
+    let dialog = await screen.findByRole('dialog', { name: '会话列表' });
+    expect(within(dialog).getByText('已有会话')).toBeInTheDocument();
+    expect(within(dialog).queryByText('空白会话')).not.toBeInTheDocument();
+
+    await user.click(within(dialog).getByRole('button', { name: '从历史新建会话' }));
+    const browserDialog = screen.getByRole('dialog', { name: '选择浏览器' });
+    await user.click(within(browserDialog).getByRole('button', { name: '使用独立浏览器' }));
+    await user.click(screen.getByRole('button', { name: '打开会话' }));
+    dialog = screen.getByRole('dialog', { name: '会话列表' });
+    expect(within(dialog).queryByText('新对话')).not.toBeInTheDocument();
+
+    await waitFor(() => {
+      const savedSessions = storage.set.mock.calls
+        .map(([value]) => value.chatSessions)
+        .filter((value) => Array.isArray(value))
+        .at(-1);
+      expect(savedSessions).toEqual([
+        expect.objectContaining({ id: 'saved-session' }),
+      ]);
+    });
+  });
+
   it('后端不可用时显示可操作的错误状态', async () => {
     const user = userEvent.setup();
     mockChromeStorage();

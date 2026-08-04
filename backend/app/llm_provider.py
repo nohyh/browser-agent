@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Protocol
 
-from pydantic import Field, ValidationError, field_validator
+from pydantic import AliasChoices, Field, ValidationError, field_validator
 
 from app.models import AgentAction, AgentDecision
 from app.utils.errors import is_transient_error
@@ -17,6 +17,8 @@ from app.utils.errors import is_transient_error
 class _ProviderAgentAction(AgentAction):
     """严格输出边界使用字符串承载可变工具参数。"""
 
+    # 部分兼容厂商会把函数名修复为 type，边界层统一收敛为内部 name。
+    name: str = Field(validation_alias=AliasChoices("name", "type"))
     arguments: str
 
     @field_validator("arguments", mode="before")

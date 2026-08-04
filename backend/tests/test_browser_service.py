@@ -71,6 +71,24 @@ class BrowserServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("http://127.0.0.1:9222", candidates)
 
+    def test_chrome_cdp_candidates_skip_closed_fallback_ports(self):
+        open_connection = MagicMock()
+        with patch(
+            "app.browser_process.socket.create_connection",
+            side_effect=[OSError("closed"), open_connection],
+        ) as connect:
+            candidates = get_chrome_cdp_candidates([])
+
+        self.assertEqual(candidates, ["http://127.0.0.1:9229"])
+        self.assertEqual(
+            connect.call_args_list,
+            [
+                call(("127.0.0.1", 9222), timeout=0.2),
+                call(("127.0.0.1", 9229), timeout=0.2),
+            ],
+        )
+        open_connection.close.assert_called_once_with()
+
     async def test_cli_session_start_runs_in_worker_thread(self):
         completed = SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -183,7 +201,8 @@ class BrowserServiceTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
         )
-        browser = BrowserService(client)
+        events = []
+        browser = BrowserService(client, lifecycle_sink=events.append)
         with patch(
             "app.mcp_client.run_agent_browser_cli",
             new=AsyncMock(
@@ -209,6 +228,24 @@ class BrowserServiceTests(unittest.IsolatedAsyncioTestCase):
             "agent_browser_snapshot",
         )
         self.assertTrue(context.exception.retryable)
+        self.assertEqual(context.exception.phase, "mcp_response")
+        self.assertGreaterEqual(context.exception.duration_ms, 1)
+        self.assertEqual(
+            events[-1],
+            {
+                "type": "browser_transport",
+                "event": "tool_failed",
+                "tool_name": "agent_browser_snapshot",
+                "runtime_session_id": ANY,
+                "status": "timed_out",
+                "phase": "mcp_response",
+                "duration_ms": ANY,
+                "error": {
+                    "type": "BrowserToolTimeout",
+                    "message": "agent_browser_snapshot timed out after 0.01 seconds",
+                },
+            },
+        )
 
     async def test_mcp_timeout_response_uses_same_structured_error(self):
         client = SimpleNamespace(
@@ -222,7 +259,8 @@ class BrowserServiceTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
         )
-        browser = BrowserService(client)
+        events = []
+        browser = BrowserService(client, lifecycle_sink=events.append)
         with patch(
             "app.mcp_client.run_agent_browser_cli",
             new=AsyncMock(
@@ -242,6 +280,48 @@ class BrowserServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             context.exception.tool_name,
             "agent_browser_snapshot",
+        )
+        self.assertEqual(context.exception.phase, "agent_browser")
+        self.assertEqual(events[-1]["type"], "browser_transport")
+        self.assertEqual(events[-1]["phase"], "agent_browser")
+
+    async def test_slow_mcp_call_records_transport_duration(self):
+        async def delayed_result(*args, **kwargs):
+            await asyncio.sleep(0.01)
+            return mcp_result({"snapshot": "ready"})
+
+        client = SimpleNamespace(
+            call_tool=AsyncMock(side_effect=[ready_session_info()])
+        )
+        events = []
+        browser = BrowserService(client, lifecycle_sink=events.append)
+        with patch(
+            "app.mcp_client.run_agent_browser_cli",
+            new=AsyncMock(
+                return_value={"success": True, "data": {"url": "about:blank"}}
+            ),
+        ):
+            managed = await browser.start_session("browser-session-1")
+        client.call_tool.side_effect = delayed_result
+
+        with patch("app.mcp_client.SLOW_BROWSER_TOOL_SECONDS", 0.005):
+            await browser.call_tool(
+                browser_session_id="browser-session-1",
+                name="agent_browser_snapshot",
+                arguments={},
+            )
+
+        self.assertEqual(
+            events[-1],
+            {
+                "type": "browser_transport",
+                "event": "tool_slow",
+                "tool_name": "agent_browser_snapshot",
+                "runtime_session_id": managed.runtime_session_id,
+                "status": "succeeded",
+                "phase": "mcp_response",
+                "duration_ms": ANY,
+            },
         )
 
     async def test_windows_isolated_start_uses_cli_once_then_mcp_health(self):
@@ -647,8 +727,14 @@ class BrowserServiceTests(unittest.IsolatedAsyncioTestCase):
         restart.assert_awaited_once_with(managed)
         self.assertEqual(result["data"]["url"], "https://x.com/elonmusk")
         self.assertEqual(managed.status, "ready")
+        self.assertEqual(events[0]["type"], "browser_transport")
+        self.assertEqual(events[0]["event"], "tool_failed")
         self.assertEqual(
-            [event["event"] for event in events],
+            [
+                event["event"]
+                for event in events
+                if event["type"] == "browser_session"
+            ],
             ["runtime_recovery_started", "runtime_recovery_succeeded"],
         )
         self.assertEqual(

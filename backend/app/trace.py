@@ -97,6 +97,8 @@ class TraceRecorder:
                 title = "Token 使用"
             elif event_type == "browser_session":
                 title = "浏览器会话"
+            elif event_type == "browser_transport":
+                title = "浏览器传输"
             else:
                 title = "错误"
 

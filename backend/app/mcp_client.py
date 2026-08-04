@@ -21,6 +21,7 @@ from app.browser_process import (
 
 BROWSER_TOOL_TIMEOUT_SECONDS = 30
 BROWSER_SESSION_HEALTH_TIMEOUT_SECONDS = 5
+SLOW_BROWSER_TOOL_SECONDS = 5
 PROJECT_RUNTIME_SESSION_PREFIX = "browser-agent-"
 BROWSER_STARTUP_URL = "about:blank"
 RUNTIME_DISCONNECT_MARKERS = (
@@ -42,9 +43,18 @@ class BrowserToolTimeout(TimeoutError):
     code = "browser_tool_timeout"
     retryable = True
 
-    def __init__(self, tool_name: str, timeout_seconds: float):
+    def __init__(
+        self,
+        tool_name: str,
+        timeout_seconds: float,
+        *,
+        phase: Literal["mcp_response", "agent_browser"] = "mcp_response",
+        duration_ms: int | None = None,
+    ):
         self.tool_name = tool_name
         self.timeout_seconds = timeout_seconds
+        self.phase = phase
+        self.duration_ms = duration_ms
         super().__init__(
             f"{tool_name} timed out after {timeout_seconds} seconds"
         )
@@ -56,6 +66,8 @@ class BrowserToolTimeout(TimeoutError):
             "message": str(self),
             "tool_name": self.tool_name,
             "timeout_seconds": self.timeout_seconds,
+            "phase": self.phase,
+            "duration_ms": self.duration_ms,
             "retryable": self.retryable,
         }
 
@@ -464,20 +476,99 @@ class BrowserService:
             if timeout is None
             else timeout
         )
+        loop = asyncio.get_running_loop()
+        started = loop.time()
         try:
             result = await asyncio.wait_for(
                 self.session.call_tool(name, arguments=arguments),
                 timeout=timeout,
             )
         except TimeoutError as exc:
-            raise BrowserToolTimeout(name, timeout) from exc
+            error = BrowserToolTimeout(
+                name,
+                timeout,
+                phase="mcp_response",
+                duration_ms=round((loop.time() - started) * 1000),
+            )
+            self._emit_transport(name, arguments, error=error)
+            raise error from exc
+        except Exception as exc:
+            self._emit_transport(
+                name,
+                arguments,
+                error=exc,
+                phase="mcp_response",
+                duration_ms=round((loop.time() - started) * 1000),
+            )
+            raise
         try:
-            return unwrap(result)
+            response = unwrap(result)
         except RuntimeError as exc:
             message = str(exc).lower()
             if "timed out" in message or "timeout" in message:
-                raise BrowserToolTimeout(name, timeout) from exc
+                error = BrowserToolTimeout(
+                    name,
+                    timeout,
+                    phase="agent_browser",
+                    duration_ms=round((loop.time() - started) * 1000),
+                )
+                self._emit_transport(name, arguments, error=error)
+                raise error from exc
+            self._emit_transport(
+                name,
+                arguments,
+                error=exc,
+                phase="agent_browser",
+                duration_ms=round((loop.time() - started) * 1000),
+            )
             raise
+        duration_ms = round((loop.time() - started) * 1000)
+        if duration_ms >= SLOW_BROWSER_TOOL_SECONDS * 1000:
+            self._emit_transport(
+                name,
+                arguments,
+                phase="mcp_response",
+                duration_ms=duration_ms,
+            )
+        return response
+
+    def _emit_transport(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        error: Exception | None = None,
+        phase: Literal["mcp_response", "agent_browser"] | None = None,
+        duration_ms: int | None = None,
+    ) -> None:
+        """只记录慢调用和失败调用，避免传输观测再次制造日志膨胀。"""
+        if self.lifecycle_sink is None:
+            return
+        if isinstance(error, BrowserToolTimeout):
+            phase = error.phase
+            duration_ms = error.duration_ms
+        event: dict[str, Any] = {
+            "type": "browser_transport",
+            "event": "tool_failed" if error is not None else "tool_slow",
+            "tool_name": tool_name,
+            "runtime_session_id": arguments.get("session"),
+            "status": (
+                "timed_out"
+                if isinstance(error, BrowserToolTimeout)
+                else "failed" if error is not None else "succeeded"
+            ),
+            "phase": phase,
+            "duration_ms": duration_ms,
+        }
+        if error is not None:
+            event["error"] = {
+                "type": type(error).__name__,
+                "message": str(error) or type(error).__name__,
+            }
+        try:
+            self.lifecycle_sink(event)
+        except Exception:
+            pass
 
     @staticmethod
     def _update_session_url(

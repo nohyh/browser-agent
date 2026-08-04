@@ -183,11 +183,22 @@ class ModuleBoundaryTests(unittest.TestCase):
                     "duration_ms": 100,
                 }
             )
+            recorder.record(
+                {
+                    "type": "browser_transport",
+                    "event": "tool_failed",
+                    "tool_name": "agent_browser_open",
+                    "phase": "mcp_response",
+                    "status": "timed_out",
+                    "duration_ms": 30_000,
+                }
+            )
 
             trace_text = trace_file.read_text(encoding="utf-8")
 
         self.assertIn("## LLM 尝试", trace_text)
         self.assertIn("## 浏览器会话", trace_text)
+        self.assertIn("## 浏览器传输", trace_text)
         self.assertNotIn("## 错误", trace_text)
 
 

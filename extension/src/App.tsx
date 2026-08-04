@@ -53,6 +53,10 @@ export default function App() {
     () => sessions.find((session) => session.id === activeSessionId) ?? null,
     [activeSessionId, sessions],
   );
+  const historySessions = useMemo(
+    () => sessions.filter((session) => session.messages.length > 0),
+    [sessions],
+  );
   const modelOptions = useMemo(() => enabledModelOptions(modelSettings), [modelSettings]);
   const selectedModel = activeSession?.llmSelection || draftSelection || modelSettings.defaultSelection;
 
@@ -65,7 +69,14 @@ export default function App() {
           readModelSettings(),
         ]);
         if (mounted && Array.isArray(stored)) {
-          setSessions(stored.map(normalizeSession).filter((session): session is Session => session !== null));
+          setSessions(
+            stored
+              .map(normalizeSession)
+              .filter(
+                (session): session is Session =>
+                  session !== null && session.messages.length > 0,
+              ),
+          );
         }
         if (mounted) {
           setModelSettings(storedModelSettings);
@@ -134,8 +145,8 @@ export default function App() {
 
   useEffect(() => {
     if (!storageReady) return;
-    void writeStoredValue(CHAT_SESSIONS_STORAGE_KEY, sessions).catch(() => undefined);
-  }, [sessions, storageReady]);
+    void writeStoredValue(CHAT_SESSIONS_STORAGE_KEY, historySessions).catch(() => undefined);
+  }, [historySessions, storageReady]);
 
   const updateSession = (sessionId: string, update: (session: Session) => Session) => {
     setSessions((current) => current.map((session) => (session.id === sessionId ? update(session) : session)));
@@ -466,7 +477,7 @@ export default function App() {
       </div>
       <SessionDrawer
         open={sessionsOpen}
-        sessions={sessions}
+        sessions={historySessions}
         activeSessionId={activeSessionId}
         onClose={() => setSessionsOpen(false)}
         onSelect={selectSession}

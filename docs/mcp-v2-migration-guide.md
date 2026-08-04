@@ -9,7 +9,7 @@
 本文档编写时，项目使用：
 
 - Python MCP SDK `1.26.0`
-- `agent-browser 0.33.0`
+- `agent-browser 0.33.2`
 - stdio 传输
 - MCP 协议 `2025-11-25`
 

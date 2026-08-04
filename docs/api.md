@@ -1,6 +1,112 @@
-# agent-browser MCP API 完整参考
+# Browser Agent API 参考
 
-本文档对应本地源码和实际运行的 `agent-browser 0.33.0`。范围是 `agent-browser mcp --tools all` 暴露的完整 MCP 接口，共 152 个类型化工具。
+## 后端 LLM 配置接口
+
+Chrome 侧边栏先通过 `POST /llm/models` 获取一个 OpenAI 兼容地址公开的模型列表：
+
+```json
+{
+  "api_url": "https://api.openai.com/v1",
+  "api_key": "sk-..."
+}
+```
+
+成功响应为 `{"models":["gpt-5","gpt-5-mini"]}`。扩展默认勾选全部返回模型，用户可取消不需要的模型。
+
+`PUT /llm/configs` 一次同步多个调用方及各自启用的模型：
+
+```json
+{
+  "endpoints": [
+    {
+      "id": "openai",
+      "name": "OpenAI",
+      "api_url": "https://api.openai.com/v1",
+      "api_key": "sk-...",
+      "models": ["gpt-5", "gpt-5-mini"]
+    }
+  ]
+}
+```
+
+`api_url` 只接受 HTTP(S) 地址，每个调用方必须有非空 API Key 和至少一个模型。成功响应只包含非敏感字段，不会回传 API Key。同一调用方的多个模型共享一个异步客户端；不同对话可在每次任务中用 `llm_endpoint_id` 和 `llm_model` 独立切换。
+
+```json
+{
+  "configured": true,
+  "endpoints": [
+    {
+      "id": "openai",
+      "name": "OpenAI",
+      "api_url": "https://api.openai.com/v1",
+      "models": ["gpt-5", "gpt-5-mini"]
+    }
+  ]
+}
+```
+
+配置仅保存在后端进程内存中。扩展会把表单值保存在 `chrome.storage.local`，保存时立即同步，并在执行任务前重新同步。旧的单配置 `PUT /llm/config` 仍保留用于兼容。
+
+`OPENAI_API_KEY`、`OPENAI_MODEL` 和可选的 `OPENAI_BASE_URL` 仍可作为启动默认值，但不再是后端启动的必要条件。若环境变量和前端均未配置，`POST /agent/run` 返回 `409`，错误码为 `llm_not_configured`。
+
+API Key 不会出现在配置接口响应中，但会由扩展发送给本机后端并保留在当前进程内存中。部署时应只在可信本机网络上暴露该后端。
+
+## Agent 运行、实时轨迹与取消
+
+`POST /agent/run/stream` 接收与 `POST /agent/run` 相同的任务字段，并增加客户端生成的 `run_id`。响应类型为 `application/x-ndjson`，按行依次返回 `run_started`、若干 `trace`、`result` 和 `done`。轨迹只包含脱敏后的分析阶段、目标、工具调用和结果，不返回模型隐式思维链。
+
+```json
+{
+  "message": "总结当前页面",
+  "conversation_id": "conversation-1",
+  "browser_session_id": "browser-agent-conversation-1",
+  "run_id": "run-1",
+  "llm_endpoint_id": "openai",
+  "llm_model": "gpt-5-mini"
+}
+```
+
+执行中的任务可通过 `DELETE /agent/runs/{run_id}` 取消。同一个 `conversation_id` 的并发轮次会被串行化，避免消息、模型和轨迹交叉污染。`POST /agent/run` 继续作为非流式兼容接口。
+
+## 浏览器会话显式绑定
+
+`POST /browser/session/start` 的 `mode` 支持 `current`、`isolated` 和 `existing`。扩展不会再根据任务文本猜测浏览器；用户可以先在首页输入并发送任务，首次发送时再选择当前浏览器或独立浏览器，选择完成后任务会自动继续执行。点击新建对话也可以先完成同样的一次性选择。选择会保存为对话属性，输入框中不能中途切换。每个对话使用独立的 `browser_session_id`。
+
+`current` 绑定整个用户 Chrome 实例：Agent 可以读取和切换其中的普通页面，也可以新建标签页。`expected_url` 是兼容旧客户端的可选初始页面提示，仅用于连接后优先选择起始标签页；缺失或匹配不到都不会限制浏览器连接。扩展需要 `tabs`、`activeTab` 和 `scripting` 权限，在能读取 HTTP(S) 当前页时发送该提示，停留在 `chrome://` 等内部页面时也可以直接绑定浏览器。后端读取 Chrome 的 `DevToolsActivePort`，通过 agent-browser 的显式 `--cdp` 地址附加全部已有页面。这里不能使用 `--auto-connect`，因为 agent-browser 会按其保护用户页面的默认语义额外创建一个空白标签页。连接失败时返回错误，绝不回退到独立浏览器。`isolated` 会启动后端托管的独立 Chrome。强制接管指定 CDP 地址时使用 `existing` 和 `cdp_url`。
+
+Windows 独立浏览器启动后，后端会通过 DevTools target 列表关闭 Chrome 自建且 agent-browser 不可见的 `chrome://newtab`，并轮询确认只留下受控 `about:blank` 页面。
+
+## 当前页面快捷建议
+
+`POST /page/suggestions` 接收扩展从当前活动标签页提取的精简文本，通过一次普通 LLM 请求生成 2 到 3 条快捷任务。该接口不会创建 Agent、浏览器会话或执行页面操作。
+
+```json
+{
+  "url": "https://example.com/guide",
+  "title": "使用指南",
+  "content": "页面标题、正文摘要和可见操作",
+  "locale": "zh-CN",
+  "limit": 3
+}
+```
+
+成功响应：
+
+```json
+{
+  "suggestions": [
+    "总结当前页面",
+    "提取关键步骤",
+    "整理成操作清单"
+  ]
+}
+```
+
+页面内容按不可信数据处理。未配置 LLM 时返回 `409`；模型没有生成至少两条有效建议时返回 `502`。
+
+## agent-browser MCP API 完整参考
+
+本文档对应本地源码和实际运行的 `agent-browser 0.33.2`。该版本修复了真实 Chrome 标签页被丢弃时 daemon 卡死的问题。范围是 `agent-browser mcp --tools all` 暴露的完整 MCP 接口，共 152 个类型化工具。
 
 ## 1. 能力边界
 

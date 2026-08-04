@@ -366,6 +366,62 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(usage.failed_llm_calls, 1)
         self.assertEqual(usage.usage_unavailable_calls, 2)
 
+    async def test_repaired_action_type_is_normalized_to_internal_name(self):
+        from app.llm_provider import OpenAIResponsesAdapter
+
+        invalid_output = "status: continue\nactions: wait for url"
+        with self.assertRaises(ValidationError) as error_context:
+            OpenAIResponsesAdapter.DECISION_FORMAT.model_validate_json(
+                invalid_output
+            )
+        repaired_output = json.dumps(
+            {
+                "status": "continue",
+                "evaluation_previous_goal": "创建请求已经提交。",
+                "memory": "正在等待异步创建完成。",
+                "next_goal": "等待目标仓库页面出现。",
+                "actions": [
+                    {
+                        "type": "agent_browser_wait_for_url",
+                        "arguments": json.dumps(
+                            {
+                                "url": "https://github.com/example/repo",
+                                "timeout": 90_000,
+                            }
+                        ),
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+        llm = AgentLLM(
+            FakeOpenAIClient(
+                [error_context.exception],
+                summaries=[repaired_output],
+            ),
+            model="test-model",
+        )
+
+        decision, _ = await llm.decide(
+            observation={"snapshot": "creating"},
+            messages=[{"role": "user", "content": "创建仓库"}],
+            task_context=[],
+            tools=[],
+        )
+
+        self.assertEqual(
+            decision.actions,
+            [
+                AgentAction(
+                    name="agent_browser_wait_for_url",
+                    arguments={
+                        "url": "https://github.com/example/repo",
+                        "timeout": 90_000,
+                    },
+                )
+            ],
+        )
+
     async def test_fenced_provider_json_is_recovered_without_llm_repair(self):
         from app.llm_provider import OpenAIResponsesAdapter
 

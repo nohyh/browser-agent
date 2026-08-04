@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +14,20 @@ from mcp import StdioServerParameters
 
 
 BROWSER_SESSION_START_TIMEOUT_SECONDS = 35
+CDP_PORT_PROBE_TIMEOUT_SECONDS = 0.2
+
+
+def _local_port_is_open(port: int) -> bool:
+    """快速排除未监听的兜底端口，避免每个地址都等待完整启动超时。"""
+    try:
+        connection = socket.create_connection(
+            ("127.0.0.1", port),
+            timeout=CDP_PORT_PROBE_TIMEOUT_SECONDS,
+        )
+    except OSError:
+        return False
+    connection.close()
+    return True
 
 
 def get_chrome_cdp_candidates(
@@ -72,6 +87,8 @@ def get_chrome_cdp_candidates(
 
     for port in (9222, 9229):
         if port in discovered_ports:
+            continue
+        if not _local_port_is_open(port):
             continue
         candidate = f"http://127.0.0.1:{port}"
         candidates.append(candidate)
