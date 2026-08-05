@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite build --watch",
     "build": "tsc && vite build",
-    "test": "vitest run",
+    "test": "vitest run --pool=forks --poolOptions.forks.singleFork --testTimeout=30000 --hookTimeout=30000",
     "preview": "vite preview"
   },
   "dependencies": {
