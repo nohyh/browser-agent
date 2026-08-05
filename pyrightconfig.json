@@ -1,4 +1,8 @@
 {
+  "include": [
+    "backend/app",
+    "backend/main.py"
+  ],
   "executionEnvironments": [
     {
       "root": "backend"
@@ -7,5 +11,8 @@
   "extraPaths": [
     "backend"
   ],
-  "typeCheckingMode": "off"
+  "typeCheckingMode": "basic",
+  "exclude": [
+    "backend/tests"
+  ]
 }

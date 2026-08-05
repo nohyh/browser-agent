@@ -7,6 +7,31 @@ on:
     branches: [ master, main ]
 
 jobs:
+  clean-checkout:
+    name: Verify Clean Checkout
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify required extension sources are tracked
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=(
+            extension/src/lib/api.ts
+            extension/src/lib/browser.ts
+            extension/src/lib/format.ts
+            extension/src/lib/models.ts
+            extension/src/lib/storage.ts
+          )
+          for file in "${expected[@]}"; do
+            test -f "$file"
+            git ls-files --error-unmatch "$file" >/dev/null
+            test -z "$(git check-ignore "$file" || true)"
+          done
+
   build-extension:
     name: Build & Test Extension
     runs-on: ubuntu-latest
@@ -47,10 +72,17 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install backend dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt pytest pytest-asyncio
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install locked backend dependencies
+        run: uv sync --locked
+
+      - name: Run Ruff
+        run: uv run ruff check backend
+
+      - name: Run Pyright
+        run: uv run pyright
 
       - name: Run pytest
-        run: pytest backend/tests
+        run: uv run pytest -q

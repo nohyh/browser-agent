@@ -25,6 +25,7 @@ eggs/
 .eggs/
 /lib/
 /lib64/
+!/extension/src/lib/
 !/extension/src/lib/**
 parts/
 sdist/
