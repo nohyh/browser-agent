@@ -222,6 +222,7 @@ class Agent:
         pending_fingerprint: tuple[str | None, str] | None = None
         failure_retry_observation_id: str | None = None
         failure_retry_count = 0
+        observation_failures = 0
         token_usage = await self._maybe_compact_conversation(
             browser_session_id,
             run_id,
@@ -295,6 +296,7 @@ class Agent:
                     pending_fingerprint = None
                     failure_retry_observation_id = observation_id
                     failure_retry_count = 0
+                    observation_failures = 0
 
                 visible_tools = select_mcp_tools_for_llm(self.browser.tools)
                 allowed_names = REGISTERED_TOOL_NAMES | TOOL_GETTER_NAMES
@@ -389,6 +391,36 @@ class Agent:
                 if provider_details is not None:
                     error_event["provider_details"] = provider_details
                 self._record(error_event)
+                # 观察阶段的工具超时/断线不再直接杀死任务：慢站点或反爬验证码
+                # 页首次加载时快照可能超时，页面仍在导航，且 pending_outcome
+                # （已执行的导航/写动作）尚未结算，允许重试一次观察。
+                if (
+                    observation_required
+                    and observation_id is not None
+                    and observation_failures < 1
+                ):
+                    observation_failures += 1
+                    failure = self._make_step_failure(
+                        stage="browser",
+                        code=str(getattr(exc, "code", None) or error_type),
+                        message=str(exc) or error_type,
+                        retryable=True,
+                        observation_id=observation_id,
+                        attempt=observation_failures,
+                    )
+                    self._record(
+                        {
+                            "type": "step_failure",
+                            **failure,
+                        }
+                    )
+                    self._append_task_context(
+                        {
+                            "type": "step_failure",
+                            **failure,
+                        }
+                    )
+                    continue
                 if (
                     str(error_type).startswith("provider_output_")
                     and observation_id is not None
@@ -907,7 +939,58 @@ class Agent:
             **payload,
             **observation_model.model_dump(exclude={"data"}),
         }
+        # 反爬验证码页（如 BOSS 直聘的安全验证）会让 open/snapshot 长时间卡住，
+        # 明确标记出来，让模型报告人工验证而不是反复重试导航。
+        security_check = self._detect_security_check(
+            url if isinstance(url, str) else None,
+            title if isinstance(title, str) else None,
+        )
+        if security_check is not None:
+            normalized["security_check"] = security_check
         return normalized
+
+    SECURITY_CHECK_URL_PATTERNS = (
+        "/captcha",
+        "/verify",
+        "geetest",
+        "hcaptcha",
+        "recaptcha",
+        "sensorsdata",
+    )
+    SECURITY_CHECK_TEXT_MARKERS = (
+        "安全验证",
+        "人机验证",
+        "滑动验证",
+        "验证码",
+        "captcha",
+    )
+
+    @classmethod
+    def _detect_security_check(
+        cls,
+        url: str | None,
+        title: str | None,
+    ) -> dict[str, str] | None:
+        """按 URL 与页面标题识别常见的验证码/反爬拦截页。"""
+        probe_text = f"{url or ''} {title or ''}".casefold()
+        matched = next(
+            (
+                marker
+                for marker in cls.SECURITY_CHECK_URL_PATTERNS
+                if marker in probe_text
+            ),
+            None,
+        )
+        if matched is None:
+            return None
+        return {
+            "kind": "captcha",
+            "matched": matched,
+            "message": (
+                "当前页面是反爬安全验证页（验证码），Agent 无法自动通过；"
+                "应报告需要用户人工完成验证，不要反复尝试导航或等待。"
+            ),
+        }
 
     def _completion_failure(
         self,

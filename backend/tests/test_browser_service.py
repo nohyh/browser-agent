@@ -237,6 +237,46 @@ class BrowserServiceTests(unittest.IsolatedAsyncioTestCase):
             arguments={"session": managed.runtime_session_id},
         )
 
+    async def test_timeout_ms_is_synced_to_agent_browser(self):
+        """客户端超时与 agent-browser 的 timeoutMs 对齐，避免通道被占。"""
+        client = SimpleNamespace(
+            call_tool=AsyncMock(
+                side_effect=[
+                    ready_session_info(),
+                    mcp_result(
+                        {"url": "about:blank", "title": "Example"}
+                    ),
+                ]
+            )
+        )
+        browser = BrowserService(client)
+        managed = self._register_current_session(browser)
+        browser.tools = [
+            mcp_tool_v2(
+                "agent_browser_open",
+                properties={"url": {"type": "string"}},
+                required=["url"],
+            )
+        ]
+        client.call_tool.reset_mock()
+
+        with patch("app.mcp_client.BROWSER_TOOL_TIMEOUT_SECONDS", 12):
+            await browser.call_tool(
+                browser_session_id=managed.browser_session_id,
+                name="agent_browser_open",
+                arguments={"url": "https://example.com"},
+            )
+
+        client.call_tool.assert_awaited_once_with(
+            "agent_browser_open",
+            arguments={
+                "session": managed.runtime_session_id,
+                "url": "https://example.com",
+                "extraArgs": ["--cdp", "ws://127.0.0.1:9222/devtools/browser/test"],
+                "timeoutMs": 12_000,
+            },
+        )
+
     async def test_tool_call_has_timeout_protection(self):
         async def wait_forever(*args, **kwargs):
             await asyncio.Event().wait()
@@ -607,6 +647,7 @@ class BrowserServiceTests(unittest.IsolatedAsyncioTestCase):
                     session.runtime_session_id,
                     "open",
                     "about:blank",
+                    "--headed",
                     "--json",
                 ),
                 call(

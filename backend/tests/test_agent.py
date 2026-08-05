@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from app.agent import Agent
 from app.llm import AgentLLM
 from app.llm_provider import ProviderDecision, ProviderOutputError
+from app.mcp_client import BrowserToolTimeout
 from app.models import AgentAction, AgentDecision
 
 
@@ -1283,6 +1284,78 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(open_result["effect"]["stabilization_retried"])
         self.assertTrue(open_result["effect"]["stabilized"])
+
+    async def test_observation_timeout_is_retried_once_instead_of_failing(self):
+        """观察超时不直接杀死任务：记录一次步骤失败后重试观察。"""
+        class TimeoutOnceBrowser(FakeBrowser):
+            def __init__(self):
+                super().__init__(snapshot_values=["READY-SNAPSHOT"])
+                self.timeout_remaining = 1
+                self.snapshot_attempts = 0
+
+            async def call_tool(self, browser_session_id, name, arguments):
+                if name == "agent_browser_snapshot":
+                    self.snapshot_attempts += 1
+                    if self.timeout_remaining > 0:
+                        self.timeout_remaining -= 1
+                        raise BrowserToolTimeout("agent_browser_snapshot", 30)
+                return await super().call_tool(
+                    browser_session_id,
+                    name,
+                    arguments,
+                )
+
+        browser = TimeoutOnceBrowser()
+        openai_client = FakeOpenAIClient([completed_decision("done")])
+        agent = Agent(
+            task="inspect",
+            browser=browser,
+            llm=AgentLLM(openai_client, model="test-model"),
+        )
+
+        result = await agent.run("browser-session-1")
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.answer, "done")
+        self.assertEqual(browser.snapshot_attempts, 2)
+        failures = [
+            event for event in agent.trace if event["type"] == "step_failure"
+        ]
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["stage"], "browser")
+        self.assertEqual(failures[0]["code"], "tool_timeout")
+        self.assertTrue(failures[0]["retryable"])
+
+    async def test_observation_timeout_stops_after_one_retry(self):
+        """观察连续超时两次时任务以失败结束，而不是无限重试。"""
+        class AlwaysTimeoutBrowser(FakeBrowser):
+            def __init__(self):
+                super().__init__()
+                self.snapshot_attempts = 0
+
+            async def call_tool(self, browser_session_id, name, arguments):
+                if name == "agent_browser_snapshot":
+                    self.snapshot_attempts += 1
+                    raise BrowserToolTimeout("agent_browser_snapshot", 30)
+                return await super().call_tool(
+                    browser_session_id,
+                    name,
+                    arguments,
+                )
+
+        browser = AlwaysTimeoutBrowser()
+        openai_client = FakeOpenAIClient([completed_decision("done")])
+        agent = Agent(
+            task="inspect",
+            browser=browser,
+            llm=AgentLLM(openai_client, model="test-model"),
+        )
+
+        result = await agent.run("browser-session-1")
+
+        self.assertFalse(result.success)
+        self.assertEqual(browser.snapshot_attempts, 2)
+        self.assertIn("Agent decision failed", result.answer)
 
     async def test_navigation_is_decided_by_llm_after_observation(self):
         browser = FakeBrowser()
@@ -2700,6 +2773,45 @@ class ObservationContractTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(formatted)
         self.assertEqual(payload["observation_id"], "observation-1")
         self.assertEqual(payload["revision"], 9)
+
+    def test_security_check_page_is_detected_and_passed_to_llm(self):
+        """反爬验证码页要标记给模型，避免反复重试导航导致工具超时。"""
+        from app.agent import Agent
+
+        detected = Agent._detect_security_check(
+            "https://www.zhipin.com/web/passport/zp/verify.html"
+            "?callbackUrl=https%3A%2F%2Fwww.zhipin.com%2F",
+            "安全验证 - BOSS直聘",
+        )
+        self.assertEqual(detected["kind"], "captcha")
+        self.assertIn("verify", detected["matched"])
+
+        formatted = json.loads(
+            AgentLLM._format_observation(
+                {
+                    "observation_id": "observation-1",
+                    "revision": 1,
+                    "security_check": detected,
+                    "data": {
+                        "snapshot": "- generic [ref=e1]",
+                        "url": "https://www.zhipin.com/web/passport/zp/verify.html",
+                        "title": "安全验证 - BOSS直聘",
+                    },
+                }
+            )
+        )
+        self.assertEqual(formatted["security_check"]["kind"], "captcha")
+        self.assertIn("人工完成验证", formatted["security_check"]["message"])
+
+    def test_normal_page_has_no_security_check(self):
+        from app.agent import Agent
+
+        self.assertIsNone(
+            Agent._detect_security_check(
+                "https://www.zhipin.com/web/geek/job",
+                "Boss直聘",
+            )
+        )
 
     async def test_page_changing_action_prefers_diff_and_falls_back_to_full_snapshot(self):
         class DiffBrowser(FakeBrowser):

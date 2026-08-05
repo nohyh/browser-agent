@@ -31,7 +31,11 @@ __all__ = [
     "ManagedBrowserSession",
     "ToolValidationError",
 ]
-from app.utils.tools import get_tool_behavior, validate_tool_arguments
+from app.utils.tools import (
+    get_tool_behavior,
+    tool_input_schema,
+    validate_tool_arguments,
+)
 
 
 BROWSER_TOOL_TIMEOUT_SECONDS = 30
@@ -343,11 +347,13 @@ class BrowserService:
         )
 
     async def _start_isolated_runtime(self, managed: ManagedBrowserSession) -> Any:
+        # agent-browser 0.33+ 默认 headless；isolated 会话要弹出可见窗口必须显式 --headed
         response = await self.launcher.run(
             "--session",
             managed.runtime_session_id,
             "open",
             BROWSER_STARTUP_URL,
+            "--headed",
             "--json",
         )
         if os.name == "nt":
@@ -520,6 +526,22 @@ class BrowserService:
     ) -> None:
         await self.registry.release_cdp_target(managed)
 
+    def _tool_supports_timeout_ms(self, name: str) -> bool:
+        """判断工具是否接受 timeoutMs 参数，避免向严格 schema 注入未知字段。"""
+        tool = next(
+            (
+                candidate
+                for candidate in self.tools
+                if getattr(candidate, "name", None) == name
+            ),
+            None,
+        )
+        schema = tool_input_schema(tool)
+        if not isinstance(schema, dict):
+            return False
+        properties = schema.get("properties")
+        return isinstance(properties, dict) and "timeoutMs" in properties
+
     async def _call_runtime_tool(
         self,
         name: str,
@@ -532,11 +554,18 @@ class BrowserService:
             if timeout is None
             else timeout
         )
+        # 客户端超时必须与 agent-browser 的 timeoutMs 对齐：agent-browser 默认
+        # 等 120s（如反爬验证码页会持续网络活动），客户端 30s 放弃后它仍在
+        # 执行并占住 stdio 通道，后续请求全部排队。注入 timeoutMs 让它在
+        # 客户端放弃前自行返回，通道不被占、任务可以恢复。
+        tool_arguments = dict(arguments)
+        if self._tool_supports_timeout_ms(name):
+            tool_arguments["timeoutMs"] = round(timeout * 1000)
         loop = asyncio.get_running_loop()
         started = loop.time()
         try:
             result = await asyncio.wait_for(
-                self.session.call_tool(name, arguments=arguments),
+                self.session.call_tool(name, arguments=tool_arguments),
                 timeout=timeout,
             )
         except TimeoutError as exc:

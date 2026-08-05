@@ -31,13 +31,15 @@ def mcp_tool_v2(
             idempotent_hint=None,
             open_world_hint=True,
         )
+    # 真实 agent-browser 的所有工具都带 timeoutMs 参数。
+    schema_properties = {"timeoutMs": {"type": "integer"}, **(properties or {})}
     return SimpleNamespace(
         name=name,
         description=f"{name} description",
         input_schema={
             "type": "object",
             "additionalProperties": False,
-            "properties": properties or {},
+            "properties": schema_properties,
             "required": required or [],
         },
         annotations=annotations,

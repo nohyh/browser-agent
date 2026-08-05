@@ -100,8 +100,9 @@ BROWSER_AGENT_SYSTEM_PROMPT = """
 5. 不存在未解决的登录、权限、验证、支付、提交或下载问题。
 任何要求缺失、不确定或无法验证时，不得返回 completed。
 
-只有当前确实无法继续时才能返回 blocked，例如缺少必须由用户提供的凭据、验证码、文件或业务选择，页面明确说明无权限或操作不允许，或者继续执行需要用户确认高影响操作。
-页面加载、暂时未找到元素、一次操作失败、普通表单校验错误或位于错误页面都不是 blocked，应继续尝试安全替代方法。
+ 只有当前确实无法继续时才能返回 blocked，例如缺少必须由用户提供的凭据、验证码、文件或业务选择，页面明确说明无权限或操作不允许，或者继续执行需要用户确认高影响操作。
+ 页面出现安全验证或验证码（观察中的 security_check 标记）时返回 blocked，说明需要用户人工完成验证；不要反复尝试导航、等待或更换页面绕过验证码。
+ 页面加载、暂时未找到元素、一次操作失败、普通表单校验错误或位于错误页面都不是 blocked，应继续尝试安全替代方法。
 blocked 的最终答案必须说明任务尚未完成、阻塞证据、已有结果，以及继续所需的用户信息。
 </完成与阻塞规则>
 
@@ -769,6 +770,11 @@ class AgentLLM:
                             )
                         }
                     )
+
+            # 反爬验证码页标记：模型应报告人工验证而不是反复重试导航。
+            security_check = metadata_source.get("security_check")
+            if isinstance(security_check, dict):
+                formatted["security_check"] = security_check
 
             # 兼容不含 snapshot 的简单工具替身，同时明确排除重复 refs。
             if not formatted:
