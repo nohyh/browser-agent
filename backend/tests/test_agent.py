@@ -5,37 +5,82 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, MagicMock, Mock, call, patch
+from unittest.mock import AsyncMock
 
-from fastapi import HTTPException
 from pydantic import ValidationError
 
 from app.agent import Agent
-from app.browser_process import (
-    get_chrome_cdp_candidates,
-    get_server_parameters,
-    run_agent_browser_cli,
-)
 from app.llm import AgentLLM
-from app.llm_provider import ProviderDecision
-from app.mcp_client import BrowserService, ManagedBrowserSession
-from app.models import AgentAction, AgentDecision, AgentResult
-from app.utils.tools import format_mcp_tools
+from app.llm_provider import ProviderDecision, ProviderOutputError
+from app.models import AgentAction, AgentDecision
 
 
 from tests.support import (
     FakeBrowser,
     FakeOpenAIClient,
-    FakeResponses,
     TimedProviderAdapter,
     completed_decision,
     continue_decision,
-    mcp_result,
     mcp_tool,
-    ready_session_info,
 )
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_local_deterministic_page_e2e_keeps_navigation_evidence(self):
+        browser = FakeBrowser(
+            snapshot_values=[
+                {
+                    "snapshot": '- link "Open fixture" [ref=e1]',
+                    "url": "http://127.0.0.1:8765/index.html",
+                    "title": "Fixture Home",
+                },
+                {
+                    "snapshot": '- heading "Fixture complete" [level=1]',
+                    "url": "http://127.0.0.1:8765/complete.html",
+                    "title": "Fixture Complete",
+                },
+            ]
+        )
+        provider = FakeOpenAIClient(
+            [
+                continue_decision(
+                    [
+                        AgentAction(
+                            name="agent_browser_open",
+                            arguments={
+                                "url": "http://127.0.0.1:8765/complete.html"
+                            },
+                        )
+                    ]
+                ),
+                completed_decision(
+                    "fixture complete",
+                    evidence=["页面显示 Fixture complete。"],
+                ),
+            ]
+        )
+        agent = Agent(
+            task="open the deterministic fixture",
+            browser=browser,
+            llm=AgentLLM(provider, model="test-model"),
+        )
+
+        result = await agent.run("browser-session-1")
+
+        self.assertTrue(result.success)
+        self.assertEqual(
+            [name for _, name, _ in browser.calls],
+            [
+                "agent_browser_snapshot",
+                "agent_browser_open",
+                "agent_browser_snapshot",
+            ],
+        )
+        self.assertIn(
+            "http://127.0.0.1:8765/complete.html",
+            agent.messages[-1]["content"],
+        )
+        self.assertIn("Fixture Complete", agent.messages[-1]["content"])
+
     def test_trace_timestamps_use_beijing_timezone(self):
         agent = Agent(
             task="inspect",
@@ -506,15 +551,185 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(error["provider_details"]["repair_attempted"])
         self.assertFalse(error["provider_details"]["repair_succeeded"])
-        self.assertEqual(responses.create.await_count, 2)
+        self.assertEqual(responses.create.await_count, 3)
         for repair_call in responses.create.await_args_list:
             self.assertNotIn(
                 "CURRENT-SNAPSHOT",
                 str(repair_call.kwargs["input"]),
             )
-        self.assertEqual(result.token_usage.llm_calls, 3)
-        self.assertEqual(result.token_usage.failed_llm_calls, 3)
-        self.assertEqual(result.token_usage.usage_unavailable_calls, 3)
+        self.assertEqual(result.token_usage.llm_calls, 5)
+        self.assertEqual(result.token_usage.failed_llm_calls, 5)
+        self.assertEqual(result.token_usage.usage_unavailable_calls, 5)
+
+    async def test_token_usage_extraction_tolerates_missing_detail_fields(self):
+        # 兼容端点不返回 input_tokens_details / output_tokens_details 时，
+        # 提取用量不能因为属性为 None 崩溃。
+        usage = SimpleNamespace(
+            input_tokens=10,
+            output_tokens=2,
+            total_tokens=12,
+            input_tokens_details=None,
+            output_tokens_details=None,
+        )
+        extracted = AgentLLM._extract_token_usage(
+            SimpleNamespace(usage=usage)
+        )
+
+        self.assertEqual(extracted.total_tokens, 12)
+        self.assertEqual(extracted.cached_input_tokens, 0)
+        self.assertEqual(extracted.reasoning_tokens, 0)
+
+    async def test_partial_provider_usage_keeps_retryable_provider_output_error(self):
+        # 复现真实故障：修复响应带 usage 但缺少 details 时，错误的
+        # provider_output_invalid_json 不能被 AttributeError 覆盖，且保留重试路径。
+        from app.llm_provider import OpenAIResponsesAdapter
+
+        invalid_output = (
+            '{"status":"completed","completion_evidence":['
+            '"三轮聊天已经完成"'
+        )
+        with self.assertRaises(ValidationError) as error_context:
+            OpenAIResponsesAdapter.DECISION_FORMAT.model_validate_json(
+                invalid_output
+            )
+        partial_usage = SimpleNamespace(
+            input_tokens=10,
+            output_tokens=2,
+            total_tokens=12,
+            input_tokens_details=None,
+            output_tokens_details=None,
+        )
+        responses = SimpleNamespace(
+            parse=AsyncMock(side_effect=error_context.exception),
+            create=AsyncMock(
+                return_value=SimpleNamespace(
+                    output_text="{still-invalid",
+                    usage=partial_usage,
+                )
+            ),
+        )
+        agent = Agent(
+            task="完成三轮聊天",
+            browser=FakeBrowser(),
+            llm=AgentLLM(
+                SimpleNamespace(responses=responses),
+                model="test-model",
+            ),
+        )
+
+        result = await agent.run("browser-session-1")
+
+        self.assertFalse(result.success)
+        self.assertEqual(
+            result.answer,
+            "模型返回格式异常，未能生成可靠的最终结果，请重试。",
+        )
+        error = next(event for event in agent.trace if event["type"] == "error")
+        self.assertEqual(error["error_type"], "provider_output_invalid_json")
+
+    async def test_decision_from_text_unwraps_single_key_wrapper(self):
+        # 兼容模型把决策包在 decision 等单键包装里的输出。
+        from app.llm_provider import OpenAIResponsesAdapter
+
+        wrapped = json.dumps(
+            {
+                "decision": {
+                    "status": "completed",
+                    "evaluation_previous_goal": "完成。",
+                    "memory": "完成。",
+                    "completion_evidence": ["页面已经确认。"],
+                    "final_answer": "finished",
+                }
+            },
+            ensure_ascii=False,
+        )
+        adapter = OpenAIResponsesAdapter(SimpleNamespace())
+        decision = adapter._decision_from_text(wrapped)
+
+        self.assertEqual(decision.status, "completed")
+        self.assertEqual(decision.final_answer, "finished")
+
+    async def test_decision_action_accepts_tool_alias(self):
+        # 部分模型输出 OpenAI 函数调用风格的工具字段 tool 而非 name。
+        from app.llm_provider import OpenAIResponsesAdapter
+
+        payload = json.dumps(
+            {
+                "status": "continue",
+                "evaluation_previous_goal": "进行中。",
+                "memory": "进行中。",
+                "next_goal": "打开 x.com/sama。",
+                "actions": [
+                    {
+                        "tool": "agent_browser_open",
+                        "arguments": '{"url":"https://x.com/sama"}',
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+        adapter = OpenAIResponsesAdapter(SimpleNamespace())
+        decision = adapter._decision_from_text(payload)
+
+        self.assertEqual(decision.actions[0].name, "agent_browser_open")
+        self.assertEqual(
+            decision.actions[0].arguments,
+            {"url": "https://x.com/sama"},
+        )
+
+    async def test_repair_recovers_wrapped_decision_with_tool_actions(self):
+        # 端到端复现最新故障：裸动作输出 + 修复返回 decision 包装。
+        from app.llm_provider import OpenAIResponsesAdapter
+
+        invalid_output = (
+            '{"tool": "agent_browser_open", '
+            '"arguments": "{\\"url\\":\\"https://x.com/sama\\"}"}'
+        )
+        with self.assertRaises(ValidationError) as error_context:
+            OpenAIResponsesAdapter.DECISION_FORMAT.model_validate_json(
+                invalid_output
+            )
+        wrapped = json.dumps(
+            {
+                "decision": {
+                    "status": "continue",
+                    "evaluation_previous_goal": "进入 X。",
+                    "memory": "任务进行中。",
+                    "next_goal": "打开 x.com/sama。",
+                    "actions": [
+                        {
+                            "tool": "agent_browser_open",
+                            "arguments": '{"url":"https://x.com/sama"}',
+                        }
+                    ],
+                }
+            },
+            ensure_ascii=False,
+        )
+        responses = SimpleNamespace(
+            parse=AsyncMock(side_effect=error_context.exception),
+            create=AsyncMock(
+                return_value=SimpleNamespace(
+                    output_text=wrapped,
+                    usage=None,
+                )
+            ),
+        )
+        llm = AgentLLM(SimpleNamespace(responses=responses), model="test-model")
+
+        decision, _ = await llm.decide(
+            observation={"snapshot": "page"},
+            messages=[{"role": "user", "content": "打开推文"}],
+            task_context=[],
+            tools=[],
+        )
+
+        self.assertEqual(decision.status, "continue")
+        self.assertEqual(decision.actions[0].name, "agent_browser_open")
+        self.assertEqual(
+            decision.actions[0].arguments,
+            {"url": "https://x.com/sama"},
+        )
 
     async def test_transient_llm_502_is_retried_once(self):
         class TransientLlmError(RuntimeError):
@@ -1186,7 +1401,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         browser = FakeBrowser(
             snapshot_values=[
                 '- button "other" [ref=e1]\n'
-                '- radio "Expert" [checked=false, ref=e11]'
+                '- radio "Expert" [checked=false, ref=e11]',
+                '- button "other" [ref=e1]\n'
+                '- radio "Expert" [checked=true, ref=e11]',
             ]
         )
         openai_client = FakeOpenAIClient(
@@ -1516,7 +1733,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(matching_llm_call["run_id"], click_result["run_id"])
 
-    async def test_third_identical_action_without_page_progress_is_stopped(self):
+    async def test_repeated_action_gets_nudge_then_hits_hard_limit(self):
         browser = FakeBrowser(
             snapshot_values=["UNCHANGED", "UNCHANGED", "UNCHANGED"]
         )
@@ -1529,7 +1746,13 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
         openai_client = FakeOpenAIClient(
-            [repeated, repeated, repeated, completed_decision("too late")]
+            [
+                repeated,
+                repeated,
+                repeated,
+                repeated,
+                completed_decision("too late"),
+            ]
         )
         agent = Agent(
             task="click the item",
@@ -1546,9 +1769,12 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             if call_item[1] == "agent_browser_click"
         ]
         self.assertFalse(result.success)
-        self.assertEqual(len(click_calls), 2)
-        self.assertEqual(len(openai_client.responses.calls), 3)
-        self.assertIn("no page progress", result.answer)
+        self.assertEqual(len(click_calls), 3)
+        self.assertEqual(len(openai_client.responses.calls), 4)
+        self.assertIn("hard limit", result.answer)
+        self.assertTrue(
+            any(event["type"] == "strategy_nudge" for event in agent.trace)
+        )
         repeated_result = next(
             event
             for event in reversed(agent.trace)
@@ -1556,6 +1782,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             and event["name"] == "agent_browser_click"
         )
         self.assertEqual(repeated_result["status"], "failed")
+        self.assertEqual(repeated_result["error"]["code"], "repeated_action")
         self.assertIn("RepeatedAction", repeated_result["error"]["type"])
 
     async def test_visual_overlay_wraps_browser_actions_and_is_cleaned(self):
@@ -2165,3 +2392,521 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any("PAGE-0" in message["content"] for message in agent.messages)
         )
+
+
+class P0SafetyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_write_cannot_confirm_or_complete_task(self):
+        class FailedWriteBrowser(FakeBrowser):
+            async def call_tool(self, browser_session_id, name, arguments):
+                if name == "agent_browser_fill":
+                    self.calls.append((browser_session_id, name, arguments))
+                    return {
+                        "success": False,
+                        "error": "form rejected the value",
+                    }
+                return await super().call_tool(
+                    browser_session_id,
+                    name,
+                    arguments,
+                )
+
+        browser = FailedWriteBrowser(snapshot_values=["PAGE"])
+        provider = FakeOpenAIClient(
+            [
+                continue_decision(
+                    [
+                        AgentAction(
+                            name="agent_browser_fill",
+                            arguments={"selector": "@e1", "text": "alice"},
+                        )
+                    ]
+                ),
+                completed_decision("incorrectly completed"),
+            ]
+        )
+        agent = Agent(
+            task="fill the form",
+            browser=browser,
+            llm=AgentLLM(provider, model="test-model"),
+        )
+
+        result = await agent.run("browser-session-1")
+
+        self.assertFalse(result.success)
+        mutation_events = [
+            event
+            for event in agent.trace
+            if event["type"] == "mutation_intent"
+        ]
+        self.assertEqual(
+            [event["status"] for event in mutation_events],
+            ["prepared", "dispatched", "failed"],
+        )
+        self.assertTrue(
+            any(
+                event.get("code") == "action_failed"
+                for event in agent.trace
+                if event["type"] == "completion_blocked"
+            )
+        )
+
+    async def test_failed_observed_write_stays_failed_when_page_changes(self):
+        class FailedClickBrowser(FakeBrowser):
+            async def call_tool(self, browser_session_id, name, arguments):
+                if name == "agent_browser_click":
+                    self.calls.append((browser_session_id, name, arguments))
+                    return {
+                        "success": False,
+                        "error": "click was rejected",
+                    }
+                return await super().call_tool(
+                    browser_session_id,
+                    name,
+                    arguments,
+                )
+
+        browser = FailedClickBrowser(snapshot_values=["BEFORE", "AFTER"])
+        provider = FakeOpenAIClient(
+            [
+                continue_decision(
+                    [
+                        AgentAction(
+                            name="agent_browser_click",
+                            arguments={"selector": "@e1"},
+                        )
+                    ]
+                ),
+                completed_decision("incorrectly completed"),
+            ]
+        )
+        agent = Agent(
+            task="click the button",
+            browser=browser,
+            llm=AgentLLM(provider, model="test-model"),
+        )
+
+        result = await agent.run("browser-session-1")
+
+        self.assertFalse(result.success)
+        mutation_events = [
+            event
+            for event in agent.trace
+            if event["type"] == "mutation_intent"
+        ]
+        self.assertEqual(
+            [event["status"] for event in mutation_events],
+            ["prepared", "dispatched", "failed"],
+        )
+
+    async def test_failed_action_stops_remaining_actions_in_same_decision(self):
+        class FailedFillBrowser(FakeBrowser):
+            async def call_tool(self, browser_session_id, name, arguments):
+                if name == "agent_browser_fill":
+                    self.calls.append((browser_session_id, name, arguments))
+                    return {"success": False, "error": "fill rejected"}
+                return await super().call_tool(
+                    browser_session_id,
+                    name,
+                    arguments,
+                )
+
+        browser = FailedFillBrowser(snapshot_values=["PAGE"])
+        provider = FakeOpenAIClient(
+            [
+                continue_decision(
+                    [
+                        AgentAction(
+                            name="agent_browser_fill",
+                            arguments={"selector": "@e1", "text": "alice"},
+                        ),
+                        AgentAction(
+                            name="agent_browser_click",
+                            arguments={"selector": "@e2"},
+                        ),
+                    ]
+                ),
+                completed_decision("not confirmed"),
+            ]
+        )
+        agent = Agent(
+            task="fill then submit",
+            browser=browser,
+            llm=AgentLLM(provider, model="test-model"),
+        )
+
+        await agent.run("browser-session-1")
+
+        self.assertFalse(
+            any(name == "agent_browser_click" for _, name, _ in browser.calls)
+        )
+
+    async def test_potential_write_completion_requires_post_action_observation(self):
+        browser = FakeBrowser(snapshot_values=["BEFORE", "AFTER"])
+        provider = FakeOpenAIClient(
+            [
+                continue_decision(
+                    [
+                        AgentAction(
+                            name="agent_browser_fill",
+                            arguments={"selector": "@e1", "text": "alice"},
+                        )
+                    ]
+                ),
+                completed_decision("filled"),
+            ]
+        )
+        agent = Agent(
+            task="fill the form",
+            browser=browser,
+            llm=AgentLLM(provider, model="test-model"),
+        )
+
+        result = await agent.run("browser-session-1")
+
+        self.assertTrue(result.success)
+        self.assertEqual(browser.snapshot_count, 2)
+        self.assertEqual(
+            [name for _, name, _ in browser.calls],
+            ["agent_browser_snapshot", "agent_browser_fill", "agent_browser_snapshot"],
+        )
+
+    async def test_provider_failure_is_redecided_once_on_same_observation(self):
+        provider_error = ProviderOutputError(
+            "invalid_json",
+            "invalid provider decision",
+            raw_output="not-json",
+        )
+        adapter = SimpleNamespace(
+            output_instructions="",
+            decide=AsyncMock(
+                side_effect=[
+                    provider_error,
+                    ProviderDecision(
+                        decision=completed_decision("done"),
+                        raw_response=SimpleNamespace(usage=None),
+                    ),
+                ]
+            ),
+        )
+        browser = FakeBrowser()
+        agent = Agent(
+            task="inspect",
+            browser=browser,
+            llm=AgentLLM(
+                FakeOpenAIClient([]),
+                model="test-model",
+                provider_adapter=adapter,
+            ),
+        )
+
+        result = await agent.run("browser-session-1")
+
+        self.assertTrue(result.success)
+        self.assertEqual(adapter.decide.await_count, 2)
+        self.assertEqual(browser.snapshot_count, 1)
+        failures = [
+            event for event in agent.trace if event["type"] == "step_failure"
+        ]
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["code"], "provider_output_invalid_json")
+
+    async def test_uncertain_write_is_never_replayed_after_disconnect(self):
+        class DisconnectingBrowser(FakeBrowser):
+            async def call_tool(self, browser_session_id, name, arguments):
+                self.calls.append((browser_session_id, name, arguments))
+                if name == "agent_browser_click":
+                    raise ConnectionError("connection closed")
+                return await super().call_tool(
+                    browser_session_id,
+                    name,
+                    arguments,
+                )
+
+        provider = SimpleNamespace(
+            output_instructions="",
+            decide=AsyncMock(
+                side_effect=[
+                    ProviderDecision(
+                        decision=continue_decision(
+                            [
+                                AgentAction(
+                                    name="agent_browser_click",
+                                    arguments={"selector": "@e1"},
+                                )
+                            ]
+                        ),
+                        raw_response=SimpleNamespace(usage=None),
+                    ),
+                    ProviderDecision(
+                        decision=completed_decision("done"),
+                        raw_response=SimpleNamespace(usage=None),
+                    ),
+                ]
+            ),
+        )
+        browser = DisconnectingBrowser(
+            snapshot_values=["UNCHANGED", "UNCHANGED"]
+        )
+        agent = Agent(
+            task="click once",
+            browser=browser,
+            llm=AgentLLM(
+                FakeOpenAIClient([]),
+                model="test-model",
+                provider_adapter=provider,
+                request_timeout_seconds=1,
+            ),
+        )
+
+        result = await agent.run("browser-session-1")
+
+        click_calls = [
+            call_item
+            for call_item in browser.calls
+            if call_item[1] == "agent_browser_click"
+        ]
+        self.assertEqual(len(click_calls), 1)
+        self.assertFalse(result.success)
+        mutation_events = [
+            event
+            for event in agent.trace
+            if event["type"] == "mutation_intent"
+        ]
+        self.assertEqual(
+            [event["status"] for event in mutation_events],
+            ["prepared", "dispatched", "uncertain"],
+        )
+        self.assertTrue(
+            any(
+                event["type"] == "completion_blocked"
+                for event in agent.trace
+            )
+        )
+
+
+class ObservationContractTests(unittest.IsolatedAsyncioTestCase):
+    def test_formatted_observation_keeps_top_level_revision_with_raw_data(self):
+        formatted = AgentLLM._format_observation(
+            {
+                "observation_id": "observation-1",
+                "revision": 9,
+                "data": {
+                    "snapshot": '- button "Save" [ref=e1]',
+                    "url": "https://example.test/form",
+                },
+            }
+        )
+
+        payload = json.loads(formatted)
+        self.assertEqual(payload["observation_id"], "observation-1")
+        self.assertEqual(payload["revision"], 9)
+
+    async def test_page_changing_action_prefers_diff_and_falls_back_to_full_snapshot(self):
+        class DiffBrowser(FakeBrowser):
+            def __init__(self, *args, light=None, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.light_calls = 0
+                self.light = light
+
+            async def observe_page_state(
+                self,
+                browser_session_id,
+                *,
+                previous_snapshot_hash=None,
+            ):
+                self.light_calls += 1
+                return self.light
+
+        provider = SimpleNamespace(
+            output_instructions="",
+            decide=AsyncMock(
+                side_effect=[
+                    ProviderDecision(
+                        decision=continue_decision(
+                            [
+                                AgentAction(
+                                    name="agent_browser_click",
+                                    arguments={"selector": "@e1"},
+                                )
+                            ]
+                        ),
+                        raw_response=SimpleNamespace(usage=None),
+                    ),
+                    ProviderDecision(
+                        decision=completed_decision("done"),
+                        raw_response=SimpleNamespace(usage=None),
+                    ),
+                ]
+            ),
+        )
+        browser = DiffBrowser(
+            snapshot_values=["BEFORE"],
+            light={"snapshot": "AFTER", "url": "https://example.test"},
+        )
+        agent = Agent(
+            task="navigate",
+            browser=browser,
+            llm=AgentLLM(
+                FakeOpenAIClient([]),
+                model="test-model",
+                provider_adapter=provider,
+            ),
+        )
+
+        result = await agent.run("browser-session-1")
+
+        self.assertTrue(result.success)
+        self.assertEqual(browser.light_calls, 1)
+        self.assertEqual(browser.snapshot_count, 1)
+
+        fallback_browser = DiffBrowser(
+            snapshot_values=["BEFORE", "AFTER"],
+            light={"url": "https://example.test"},
+        )
+        fallback_agent = Agent(
+            task="navigate",
+            browser=fallback_browser,
+            llm=AgentLLM(
+                FakeOpenAIClient(
+                    [
+                        continue_decision(
+                            [
+                                AgentAction(
+                                    name="agent_browser_click",
+                                    arguments={"selector": "@e1"},
+                                )
+                            ]
+                        ),
+                        completed_decision("done"),
+                    ]
+                ),
+                model="test-model",
+            ),
+        )
+
+        await fallback_agent.run("browser-session-1")
+
+        self.assertEqual(fallback_browser.light_calls, 1)
+        self.assertEqual(fallback_browser.snapshot_count, 2)
+
+    async def test_observations_have_monotonic_revisions(self):
+        browser = FakeBrowser(snapshot_values=["ONE", "TWO"])
+        agent = Agent(
+            task="inspect",
+            browser=browser,
+            llm=AgentLLM(FakeOpenAIClient([]), model="test-model"),
+        )
+
+        first = await agent.observe(
+            "browser-session-1",
+            {"action_id": "observation-1"},
+        )
+        second = await agent.observe(
+            "browser-session-1",
+            {"action_id": "observation-2"},
+        )
+
+        self.assertEqual(first["revision"], 1)
+        self.assertEqual(second["revision"], 2)
+        self.assertNotEqual(first["observation_id"], second["observation_id"])
+        self.assertEqual(first["snapshot_hash"] != second["snapshot_hash"], True)
+
+    async def test_stale_ref_is_rejected_before_browser_action(self):
+        browser = FakeBrowser(snapshot_values=["PAGE", "PAGE-REFRESHED"])
+        adapter = SimpleNamespace(
+            output_instructions="",
+            decide=AsyncMock(
+                side_effect=[
+                    ProviderDecision(
+                        decision=continue_decision(
+                            [
+                                AgentAction(
+                                    name="agent_browser_click",
+                                    arguments={"selector": "@e1"},
+                                    observation_revision=99,
+                                )
+                            ]
+                        ),
+                        raw_response=SimpleNamespace(usage=None),
+                    ),
+                    ProviderDecision(
+                        decision=completed_decision("stale ref handled"),
+                        raw_response=SimpleNamespace(usage=None),
+                    ),
+                ]
+            ),
+        )
+        agent = Agent(
+            task="use the current button",
+            browser=browser,
+            llm=AgentLLM(
+                FakeOpenAIClient([]),
+                model="test-model",
+                provider_adapter=adapter,
+            ),
+        )
+
+        await agent.run("browser-session-1")
+
+        self.assertFalse(
+            any(name == "agent_browser_click" for _, name, _ in browser.calls)
+        )
+        stale = next(
+            event
+            for event in agent.trace
+            if event["type"] == "tool_result"
+            and event["name"] == "agent_browser_click"
+        )
+        self.assertEqual(stale["error"]["code"], "stale_element_ref")
+        self.assertEqual(browser.snapshot_count, 2)
+
+
+class CompletionGateTests(unittest.TestCase):
+    def test_read_only_navigation_and_write_gates_are_distinct(self):
+        from app.models import MutationIntent
+
+        agent = Agent(
+            task="inspect",
+            browser=FakeBrowser(),
+            llm=AgentLLM(FakeOpenAIClient([]), model="test-model"),
+        )
+        decision = completed_decision("done")
+
+        agent._task_mode = "read_only"
+        read_failure = agent._completion_failure(
+            decision,
+            observation_id=None,
+            observation_required=False,
+            pending_outcome=None,
+        )
+        self.assertEqual(
+            read_failure["code"],
+            "read_only_completion_evidence_required",
+        )
+
+        agent._task_mode = "navigation"
+        navigation_failure = agent._completion_failure(
+            decision,
+            observation_id="observation-1",
+            observation_required=True,
+            pending_outcome=None,
+        )
+        self.assertEqual(
+            navigation_failure["code"],
+            "action_observation_required",
+        )
+
+        agent._task_mode = "write"
+        intent = MutationIntent(
+            action_id="run-1:action-1",
+            tool_name="agent_browser_click",
+            status="uncertain",
+        )
+        agent._pending_mutations[intent.mutation_id] = intent
+        write_failure = agent._completion_failure(
+            decision,
+            observation_id="observation-1",
+            observation_required=False,
+            pending_outcome=None,
+        )
+        self.assertEqual(write_failure["code"], "pending_mutation")

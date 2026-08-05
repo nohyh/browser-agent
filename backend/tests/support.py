@@ -1,26 +1,9 @@
 import asyncio
-import json
-import unittest
-from datetime import datetime, timedelta
-from pathlib import Path
-from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, MagicMock, Mock, call, patch
 
-from fastapi import HTTPException
-from pydantic import ValidationError
 
-from app.agent import Agent
-from app.browser_process import (
-    get_chrome_cdp_candidates,
-    get_server_parameters,
-    run_agent_browser_cli,
-)
-from app.llm import AgentLLM
 from app.llm_provider import ProviderDecision
-from app.mcp_client import BrowserService, ManagedBrowserSession
-from app.models import AgentAction, AgentDecision, AgentResult
-from app.utils.tools import format_mcp_tools
+from app.models import AgentDecision
 
 
 def mcp_tool(name: str):
@@ -28,6 +11,36 @@ def mcp_tool(name: str):
         name=name,
         description=f"{name} description",
         inputSchema={"type": "object", "properties": {}},
+    )
+
+
+def mcp_tool_v2(
+    name: str,
+    *,
+    properties: dict | None = None,
+    required: list | None = None,
+    read_only_hint: bool | None = None,
+):
+    """按 MCP 2.0 snake_case 命名构造工具，模拟真实 agent-browser 返回。"""
+    annotations = None
+    if read_only_hint is not None:
+        annotations = SimpleNamespace(
+            title=None,
+            read_only_hint=read_only_hint,
+            destructive_hint=None,
+            idempotent_hint=None,
+            open_world_hint=True,
+        )
+    return SimpleNamespace(
+        name=name,
+        description=f"{name} description",
+        input_schema={
+            "type": "object",
+            "additionalProperties": False,
+            "properties": properties or {},
+            "required": required or [],
+        },
+        annotations=annotations,
     )
 
 

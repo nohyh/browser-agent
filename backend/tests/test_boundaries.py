@@ -1,29 +1,27 @@
-import asyncio
 import json
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, MagicMock, Mock, call, patch
+from unittest.mock import Mock
 
-from fastapi import HTTPException
-from pydantic import ValidationError
 
 from app.agent import Agent
-from app.browser_process import (
-    get_chrome_cdp_candidates,
-    get_server_parameters,
-    run_agent_browser_cli,
+from app.models import (
+    AgentResult,
+    MutationIntent,
+    ToolBehavior,
 )
-from app.llm import AgentLLM
-from app.llm_provider import ProviderDecision
-from app.mcp_client import BrowserService, ManagedBrowserSession
-from app.models import AgentAction, AgentDecision, AgentResult
-from app.utils.tools import format_mcp_tools
+from app.utils.errors import ERROR_CODES, ToolValidationError, exception_details
+from app.utils.tools import (
+    format_mcp_tools,
+    get_tool_behavior,
+    validate_tool_arguments,
+)
 
 
-from tests.support import mcp_tool
+from tests.support import mcp_tool, mcp_tool_v2
 
 class ModuleBoundaryTests(unittest.TestCase):
     def test_test_suites_follow_runtime_domain_boundaries(self):
@@ -93,7 +91,7 @@ class ModuleBoundaryTests(unittest.TestCase):
     def test_agent_models_live_in_models_module(self):
         from app.models import AgentAction as ModelAgentAction
         from app.models import AgentDecision as ModelAgentDecision
-        from app.models import AgentResult, AgentTokenUsage
+        from app.models import AgentTokenUsage
 
         self.assertEqual(ModelAgentAction.__module__, "app.models")
         self.assertEqual(ModelAgentDecision.__module__, "app.models")
@@ -136,6 +134,133 @@ class ModuleBoundaryTests(unittest.TestCase):
         self.assertEqual(len(published), 1)
         self.assertEqual(published[0]["arguments"]["token"], "[REDACTED]")
         self.assertIn("timestamp", published[0])
+
+    def test_trace_recorder_writes_versioned_jsonl_with_linkage_and_redaction(self):
+        from app.trace import TraceRecorder
+
+        with TemporaryDirectory() as temp_dir:
+            trace_file = Path(temp_dir) / "conversation-1.md"
+            recorder = TraceRecorder(
+                trace_file,
+                conversation_id="conversation-1",
+            )
+            recorder.record(
+                {
+                    "type": "tool_call",
+                    "run_id": "run-1",
+                    "step_id": "run-1:step-1",
+                    "action_id": "run-1:step-1:action-1",
+                    "observation_id": "run-1:step-1:observation",
+                    "name": "agent_browser_fill",
+                    "arguments": {
+                        "selector": "@e1",
+                        "value": "sk-test-secret-value-123456",
+                        "url": "https://example.test/reset#access_token=fragment-secret",
+                    },
+                    "duration_ms": 12,
+                }
+            )
+            recorder.record(
+                {
+                    "type": "tool_result",
+                    "run_id": "run-1",
+                    "step_id": "run-1:step-1",
+                    "action_id": "run-1:step-1:action-1",
+                    "observation_id": "run-1:step-1:observation-2",
+                    "name": "agent_browser_snapshot",
+                    "status": "succeeded",
+                    "data": {
+                        "url": "https://example.test/page#secret-fragment",
+                        "snapshot": "same page snapshot",
+                    },
+                    "effect": {"page_changed": False},
+                }
+            )
+
+            jsonl_file = trace_file.with_suffix(".jsonl")
+            records = [
+                json.loads(line)
+                for line in jsonl_file.read_text(encoding="utf-8").splitlines()
+            ]
+            markdown = trace_file.read_text(encoding="utf-8")
+
+        self.assertEqual([record["sequence"] for record in records], [1, 2])
+        self.assertTrue(all(record["schema_version"] == 1 for record in records))
+        self.assertTrue(
+            all(record["conversation_id"] == "conversation-1" for record in records)
+        )
+        self.assertEqual(records[0]["phase"], "tool_dispatch")
+        self.assertEqual(records[0]["duration_ms"], 12)
+        serialized = json.dumps(records, ensure_ascii=False)
+        self.assertNotIn("sk-test-secret-value-123456", serialized)
+        self.assertNotIn("fragment-secret", serialized)
+        self.assertNotIn("secret-fragment", serialized)
+        self.assertIn("## 工具调用：agent_browser_fill", markdown)
+
+    def test_mutation_and_history_arguments_use_tool_aware_redaction(self):
+        from app.trace import TraceRecorder
+
+        with TemporaryDirectory() as temp_dir:
+            trace_file = Path(temp_dir) / "conversation-1.md"
+            recorder = TraceRecorder(trace_file)
+            recorder.record(
+                {
+                    "type": "mutation_intent",
+                    "tool_name": "agent_browser_fill",
+                    "arguments": {
+                        "selector": "@e1",
+                        "text": "private form value",
+                    },
+                    "status": "prepared",
+                }
+            )
+            serialized = trace_file.with_suffix(".jsonl").read_text(
+                encoding="utf-8"
+            )
+            markdown = trace_file.read_text(encoding="utf-8")
+
+        self.assertNotIn("private form value", serialized)
+        self.assertNotIn("private form value", markdown)
+        self.assertIn("[REDACTED]", serialized)
+
+    def test_trace_recorder_enforces_capacity_and_retention(self):
+        from app.trace import TraceRecorder, cleanup_trace_directory
+
+        with TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            trace_file = directory / "conversation-1.md"
+            recorder = TraceRecorder(trace_file, max_bytes=512)
+            recorder.record(
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "x" * 10_000,
+                }
+            )
+            old_file = directory / "old.jsonl"
+            old_file.write_text("old", encoding="utf-8")
+            old_file.touch()
+            old_timestamp = datetime.now().timestamp() - 10 * 86400
+            import os
+
+            os.utime(old_file, (old_timestamp, old_timestamp))
+
+            cleanup_trace_directory(directory, retention_days=1)
+
+            self.assertLessEqual(trace_file.stat().st_size, 512)
+            self.assertLessEqual(trace_file.with_suffix(".jsonl").stat().st_size, 512)
+            self.assertFalse(old_file.exists())
+
+    def test_quality_configuration_declares_pinned_runtime_and_checks(self):
+        root = Path(__file__).parents[2]
+        pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+        pyright = (root / "pyrightconfig.json").read_text(encoding="utf-8")
+
+        self.assertIn('requires-python = ">=3.12,<3.13"', pyproject)
+        self.assertIn('"ruff==', pyproject)
+        self.assertIn('"pyright==', pyproject)
+        self.assertIn('"pytest-timeout==', pyproject)
+        self.assertIn('typeCheckingMode": "basic"', pyright)
 
     def test_browser_process_helpers_live_in_browser_process_module(self):
         from app.browser_process import (
@@ -193,12 +318,33 @@ class ModuleBoundaryTests(unittest.TestCase):
                     "duration_ms": 30_000,
                 }
             )
+            recorder.record(
+                {
+                    "type": "mutation_intent",
+                    "mutation_id": "mutation-1",
+                    "action_id": "run-1:step-1:action-1",
+                    "tool_name": "agent_browser_click",
+                    "arguments": {"selector": "@e1"},
+                    "status": "prepared",
+                }
+            )
+            recorder.record(
+                {
+                    "type": "step_failure",
+                    "stage": "completion",
+                    "code": "pending_mutation",
+                    "retryable": True,
+                    "message": "pending mutation",
+                }
+            )
 
             trace_text = trace_file.read_text(encoding="utf-8")
 
         self.assertIn("## LLM 尝试", trace_text)
         self.assertIn("## 浏览器会话", trace_text)
         self.assertIn("## 浏览器传输", trace_text)
+        self.assertIn("## 写操作意图", trace_text)
+        self.assertIn("## 步骤失败", trace_text)
         self.assertNotIn("## 错误", trace_text)
 
 
@@ -323,3 +469,232 @@ class ToolFormattingTests(unittest.TestCase):
             REGISTERED_TOOL_NAMES,
             COMMON_TOOL_NAMES | frozenset(grouped_names),
         )
+
+
+class ToolBehaviorTests(unittest.TestCase):
+    def test_tools_have_conservative_behavior_classes(self):
+        self.assertEqual(
+            get_tool_behavior("agent_browser_get_title").category,
+            "read_only",
+        )
+        self.assertEqual(
+            get_tool_behavior("agent_browser_open").category,
+            "navigation",
+        )
+        self.assertEqual(
+            get_tool_behavior("agent_browser_click").category,
+            "potential_write",
+        )
+        self.assertTrue(get_tool_behavior("unknown_tool").potential_write)
+
+    def test_cached_mcp_annotations_override_unknown_tool_defaults(self):
+        read_only_tool = SimpleNamespace(
+            annotations={"readOnlyHint": True},
+        )
+        navigation_tool = SimpleNamespace(
+            annotations={"destructiveHint": False},
+        )
+
+        self.assertEqual(
+            get_tool_behavior("custom_read", read_only_tool).category,
+            "read_only",
+        )
+        self.assertEqual(
+            get_tool_behavior("custom_navigation", navigation_tool).category,
+            "potential_write",
+        )
+
+    def test_mcp_v2_snake_case_annotations_override_unknown_tool_defaults(self):
+        """真实 MCP 2.0 的 Tool 使用 read_only_hint（snake_case）。"""
+        read_only_tool = SimpleNamespace(
+            annotations=SimpleNamespace(read_only_hint=True),
+        )
+
+        self.assertEqual(
+            get_tool_behavior("custom_read", read_only_tool).category,
+            "read_only",
+        )
+
+    def test_mcp_v2_snake_case_schema_blocks_invalid_arguments(self):
+        """MCP 2.0 工具用 input_schema 承载参数定义，校验必须仍然生效。"""
+        fill_tool = mcp_tool_v2(
+            "agent_browser_fill",
+            properties={
+                "selector": {"type": "string"},
+                "text": {"type": "string"},
+            },
+            required=["selector", "text"],
+        )
+        with self.assertRaises(ToolValidationError) as context:
+            validate_tool_arguments(
+                "agent_browser_fill",
+                {"selector": "@e122", "value": "hello"},
+                [fill_tool],
+            )
+        self.assertEqual(context.exception.code, "invalid_tool_arguments")
+        self.assertEqual(
+            context.exception.details["missing"],
+            ["text"],
+        )
+        self.assertEqual(
+            context.exception.details["unknown"],
+            ["value"],
+        )
+
+    def test_mcp_v2_snake_case_schema_is_formatted_with_parameters(self):
+        """工具签名必须包含参数，模型才能正确构造调用。"""
+        fill_tool = mcp_tool_v2(
+            "agent_browser_fill",
+            properties={
+                "selector": {"type": "string"},
+                "text": {"type": "string"},
+            },
+            required=["selector", "text"],
+        )
+
+        descriptions = format_mcp_tools([fill_tool])
+
+        self.assertIn(
+            "agent_browser_fill(selector:string; text:string)",
+            descriptions,
+        )
+
+    def test_input_schema_validation_covers_nested_values(self):
+        tool = SimpleNamespace(
+            name="agent_browser_custom_tool",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "options": {
+                        "type": "object",
+                        "properties": {
+                            "mode": {"enum": ["fast", "safe"]},
+                            "tags": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": ["mode"],
+                        "additionalProperties": False,
+                    },
+                },
+                "required": ["options"],
+            },
+        )
+
+        with self.assertRaises(ValueError) as context:
+            validate_tool_arguments(
+                tool.name,
+                {"options": {"mode": "slow", "tags": ["ok", 1]}},
+                [tool],
+            )
+
+        details = context.exception.details
+        self.assertIn("options.mode", {
+            item["field"] for item in details["invalid_enums"]
+        })
+        self.assertIn("options.tags[1]", {
+            item["field"] for item in details["invalid_types"]
+        })
+
+    def test_error_code_registry_includes_public_runtime_and_completion_codes(self):
+        self.assertTrue(
+            {
+                "runtime_not_ready",
+                "browser_session_not_ready",
+                "pending_mutation",
+                "action_observation_required",
+                "repeated_action",
+            }
+            <= ERROR_CODES
+        )
+
+    def test_mutation_intent_has_explicit_lifecycle(self):
+        intent = MutationIntent(
+            action_id="run-1:action-1",
+            tool_name="agent_browser_click",
+            arguments={"selector": "@e1"},
+            status="prepared",
+        )
+        self.assertEqual(intent.status, "prepared")
+        self.assertIsInstance(
+            ToolBehavior(name="agent_browser_click").model_dump(),
+            dict,
+        )
+
+    def test_provider_contract_accepts_name_type_and_object_arguments(self):
+        from app.llm_provider import OpenAIResponsesAdapter
+
+        decision = OpenAIResponsesAdapter._to_agent_decision(
+            {
+                "status": "continue",
+                "evaluation_previous_goal": "需要继续。",
+                "memory": "当前页面有目标。",
+                "next_goal": "点击目标。",
+                "actions": [
+                    {
+                        "type": "agent_browser_click",
+                        "arguments": {"selector": "@e1"},
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(decision.actions[0].name, "agent_browser_click")
+        self.assertEqual(
+            decision.actions[0].arguments,
+            {"selector": "@e1"},
+        )
+
+    def test_provider_contract_preserves_observation_binding_metadata(self):
+        from app.llm_provider import OpenAIResponsesAdapter
+
+        decision = OpenAIResponsesAdapter._to_agent_decision(
+            {
+                "status": "continue",
+                "evaluation_previous_goal": "需要继续。",
+                "memory": "当前页面有目标。",
+                "next_goal": "点击目标。",
+                "actions": [
+                    {
+                        "name": "agent_browser_click",
+                        "arguments": '{"selector":"@e1"}',
+                        "observation_id": "observation-1",
+                        "observation_revision": 7,
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(decision.actions[0].observation_id, "observation-1")
+        self.assertEqual(decision.actions[0].observation_revision, 7)
+
+    def test_error_details_expose_stable_code(self):
+        from app.mcp_client import ToolValidationError
+
+        details = exception_details(
+            ToolValidationError(
+                "agent_browser_click",
+                {"selector": "bad"},
+                {"missing": ["selector"]},
+            )
+        )
+        self.assertEqual(details["code"], "invalid_tool_arguments")
+
+    def test_token_estimator_reports_named_input_slots(self):
+        from app.llm import TokenEstimator
+
+        estimator = TokenEstimator(chars_per_token=4)
+        slots = estimator.slot_metrics(
+            system="system prompt",
+            history="history",
+            observation="page observation",
+            tool_result="tool result",
+        )
+
+        self.assertEqual(
+            set(slots),
+            {"system", "history", "observation", "tool_result"},
+        )
+        self.assertGreater(slots["observation"]["estimated_tokens"], 0)
+        self.assertIn("budget_tokens", slots["tool_result"])

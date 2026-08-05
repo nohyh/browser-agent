@@ -1,31 +1,78 @@
 import asyncio
 import json
+import os
 import unittest
-from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, MagicMock, Mock, call, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
+from urllib.request import urlopen
 
-from fastapi import HTTPException
-from pydantic import ValidationError
+from mcp.types import CallToolResult
 
-from app.agent import Agent
 from app.browser_process import (
     get_chrome_cdp_candidates,
     get_server_parameters,
     run_agent_browser_cli,
 )
-from app.llm import AgentLLM
-from app.llm_provider import ProviderDecision
-from app.mcp_client import BrowserService, ManagedBrowserSession
-from app.models import AgentAction, AgentDecision, AgentResult
-from app.utils.tools import format_mcp_tools
+from app.mcp_client import (
+    BrowserService,
+    BrowserSessionDisconnected,
+    ManagedBrowserSession,
+    ToolValidationError,
+    unwrap,
+)
+from app.runtime_supervisor import BrowserRuntimeSupervisor
 
 
-from tests.support import mcp_result, mcp_tool, ready_session_info
+from tests.support import mcp_result, mcp_tool, mcp_tool_v2, ready_session_info
 
 class BrowserServiceTests(unittest.IsolatedAsyncioTestCase):
+    def test_unwrap_reads_mcp_v2_structured_content(self):
+        result = CallToolResult(
+            content=[],
+            structuredContent={
+                "response": {
+                    "success": True,
+                    "data": {"url": "about:blank"},
+                }
+            },
+            isError=False,
+        )
+
+        self.assertEqual(
+            unwrap(result),
+            {"success": True, "data": {"url": "about:blank"}},
+        )
+
+    def test_unwrap_reads_mcp_v2_error_flag(self):
+        result = CallToolResult(
+            content=[],
+            structuredContent={},
+            isError=True,
+        )
+
+        with self.assertRaises(RuntimeError):
+            unwrap(result)
+
+    @unittest.skipUnless(
+        os.getenv("BROWSER_AGENT_REAL_SMOKE") == "1",
+        "set BROWSER_AGENT_REAL_SMOKE=1 to run the bounded network smoke test",
+    )
+    async def test_real_website_smoke_is_bounded_and_non_blocking(self):
+        def fetch() -> tuple[int, str]:
+            with urlopen("https://example.com/", timeout=5) as response:
+                return response.status, response.geturl()
+
+        status, url = await asyncio.wait_for(
+            asyncio.to_thread(fetch),
+            timeout=6,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(url.startswith("https://example.com"))
+
     @staticmethod
     def _register_current_session(
         browser: BrowserService,
@@ -222,7 +269,7 @@ class BrowserServiceTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertTrue(browser.is_session_ready("browser-session-1"))
-        self.assertEqual(context.exception.code, "browser_tool_timeout")
+        self.assertEqual(context.exception.code, "tool_timeout")
         self.assertEqual(
             context.exception.tool_name,
             "agent_browser_snapshot",
@@ -246,6 +293,206 @@ class BrowserServiceTests(unittest.IsolatedAsyncioTestCase):
                 },
             },
         )
+
+    async def test_read_only_disconnect_is_retried_once_after_recovery(self):
+        client = SimpleNamespace(
+            call_tool=AsyncMock(
+                side_effect=[
+                    ConnectionError("connection closed"),
+                    mcp_result({"title": "Example"}),
+                ]
+            )
+        )
+        browser = BrowserService(client)
+        managed = self._register_current_session(browser)
+        browser._recover_runtime = AsyncMock()
+
+        result = await browser.call_tool(
+            browser_session_id=managed.browser_session_id,
+            name="agent_browser_get_title",
+            arguments={},
+        )
+
+        self.assertEqual(result["data"]["title"], "Example")
+        self.assertEqual(client.call_tool.await_count, 2)
+        browser._recover_runtime.assert_awaited_once()
+
+    async def test_navigation_disconnect_recovers_without_replaying_action(self):
+        client = SimpleNamespace(
+            call_tool=AsyncMock(
+                side_effect=ConnectionError("connection closed")
+            )
+        )
+        browser = BrowserService(client)
+        managed = self._register_current_session(browser)
+        browser._recover_runtime = AsyncMock()
+
+        with self.assertRaises(BrowserSessionDisconnected) as context:
+            await browser.call_tool(
+                browser_session_id=managed.browser_session_id,
+                name="agent_browser_open",
+                arguments={"url": "https://example.com"},
+            )
+
+        self.assertEqual(client.call_tool.await_count, 1)
+        browser._recover_runtime.assert_awaited_once()
+        self.assertTrue(context.exception.recovered)
+        self.assertEqual(context.exception.code, "session_disconnected")
+
+    async def test_potential_write_disconnect_is_uncertain_without_replay(self):
+        client = SimpleNamespace(
+            call_tool=AsyncMock(
+                side_effect=ConnectionError("connection closed")
+            )
+        )
+        browser = BrowserService(client)
+        managed = self._register_current_session(browser)
+        browser._recover_runtime = AsyncMock()
+
+        with self.assertRaises(BrowserSessionDisconnected) as context:
+            await browser.call_tool(
+                browser_session_id=managed.browser_session_id,
+                name="agent_browser_click",
+                arguments={"selector": "@e1"},
+            )
+
+        self.assertEqual(client.call_tool.await_count, 1)
+        browser._recover_runtime.assert_awaited_once()
+        self.assertTrue(context.exception.uncertain)
+        self.assertEqual(context.exception.code, "action_uncertain")
+
+    async def test_invalid_tool_arguments_are_rejected_before_mcp_call(self):
+        client = SimpleNamespace(call_tool=AsyncMock())
+        browser = BrowserService(client)
+        managed = self._register_current_session(browser)
+        browser.tools = [
+            mcp_tool_v2(
+                "agent_browser_click",
+                properties={"selector": {"type": "string"}},
+                required=["selector"],
+            )
+        ]
+
+        with self.assertRaises(ToolValidationError) as context:
+            await browser.call_tool(
+                managed.browser_session_id,
+                "agent_browser_click",
+                {},
+            )
+
+        self.assertEqual(context.exception.code, "invalid_tool_arguments")
+        self.assertIn("selector", context.exception.details["missing"])
+        client.call_tool.assert_not_awaited()
+
+    async def test_cached_read_only_annotation_allows_one_disconnect_retry(self):
+        client = SimpleNamespace(
+            call_tool=AsyncMock(
+                side_effect=[
+                    ConnectionError("connection closed"),
+                    mcp_result({"title": "Example"}),
+                ]
+            )
+        )
+        browser = BrowserService(client)
+        managed = self._register_current_session(browser)
+        browser.tools = [
+            mcp_tool_v2(
+                "custom_read_tool",
+                properties={},
+                read_only_hint=True,
+            )
+        ]
+        browser._recover_runtime = AsyncMock()
+
+        result = await browser.call_tool(
+            managed.browser_session_id,
+            "custom_read_tool",
+            {},
+        )
+
+        self.assertEqual(result["data"]["title"], "Example")
+        self.assertEqual(client.call_tool.await_count, 2)
+        browser._recover_runtime.assert_awaited_once()
+
+
+    async def test_runtime_supervisor_tracks_ready_and_stopped_states(self):
+        events = []
+        browser = SimpleNamespace(close_all_sessions=AsyncMock())
+
+        @asynccontextmanager
+        async def factory():
+            events.append("enter")
+            try:
+                yield browser
+            finally:
+                events.append("exit")
+
+        supervisor = BrowserRuntimeSupervisor(factory)
+
+        await supervisor.start()
+
+        self.assertEqual(supervisor.status, "ready")
+        self.assertIs(supervisor.service, browser)
+        self.assertEqual(supervisor.snapshot()["status"], "ready")
+
+        await supervisor.stop()
+
+        self.assertEqual(supervisor.status, "stopped")
+        self.assertEqual(events, ["enter", "exit"])
+        browser.close_all_sessions.assert_awaited_once()
+
+    async def test_runtime_supervisor_exposes_degraded_state_after_start_failure(self):
+        async def factory():
+            raise RuntimeError("MCP unavailable")
+
+        supervisor = BrowserRuntimeSupervisor(factory)
+
+        await supervisor.start()
+
+        self.assertEqual(supervisor.status, "degraded")
+        self.assertIn("MCP unavailable", supervisor.last_error or "")
+        self.assertIsNone(supervisor.service)
+
+    async def test_runtime_rebuild_requests_are_coalesced(self):
+        enters = 0
+        browsers = []
+
+        @asynccontextmanager
+        async def factory():
+            nonlocal enters
+            enters += 1
+            browser = SimpleNamespace(close_all_sessions=AsyncMock())
+            browsers.append(browser)
+            yield browser
+
+        supervisor = BrowserRuntimeSupervisor(factory)
+        await supervisor.start()
+        await asyncio.gather(supervisor.rebuild(), supervisor.rebuild())
+
+        self.assertEqual(enters, 2)
+        self.assertEqual(supervisor.status, "ready")
+        self.assertEqual(supervisor.generation, 2)
+        self.assertEqual(browsers[0].close_all_sessions.await_count, 1)
+
+    async def test_runtime_rebuild_close_failure_enters_degraded_state(self):
+        browser = SimpleNamespace(
+            close_all_sessions=AsyncMock(
+                side_effect=RuntimeError("runtime close failed")
+            )
+        )
+
+        @asynccontextmanager
+        async def factory():
+            yield browser
+
+        supervisor = BrowserRuntimeSupervisor(factory)
+        await supervisor.start()
+
+        await supervisor.rebuild()
+
+        self.assertEqual(supervisor.status, "degraded")
+        self.assertIsNone(supervisor.service)
+        self.assertIn("runtime close failed", supervisor.last_error or "")
 
     async def test_mcp_timeout_response_uses_same_structured_error(self):
         client = SimpleNamespace(
@@ -276,7 +523,7 @@ class BrowserServiceTests(unittest.IsolatedAsyncioTestCase):
                 arguments={},
             )
 
-        self.assertEqual(context.exception.code, "browser_tool_timeout")
+        self.assertEqual(context.exception.code, "tool_timeout")
         self.assertEqual(
             context.exception.tool_name,
             "agent_browser_snapshot",
@@ -693,7 +940,7 @@ class BrowserServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-    async def test_runtime_disconnect_recovers_same_session_and_retries_once(self):
+    async def test_runtime_disconnect_recovers_without_replaying_write_action(self):
         client = SimpleNamespace(
             call_tool=AsyncMock(
                 side_effect=[
@@ -718,14 +965,16 @@ class BrowserServiceTests(unittest.IsolatedAsyncioTestCase):
             "_start_runtime",
             new=AsyncMock(return_value={"success": True}),
         ) as restart:
-            result = await browser.call_tool(
-                "current",
-                "agent_browser_click",
-                {"selector": "@e1"},
-            )
+            with self.assertRaises(BrowserSessionDisconnected) as context:
+                await browser.call_tool(
+                    "current",
+                    "agent_browser_click",
+                    {"selector": "@e1"},
+                )
 
         restart.assert_awaited_once_with(managed)
-        self.assertEqual(result["data"]["url"], "https://x.com/elonmusk")
+        self.assertTrue(context.exception.uncertain)
+        self.assertEqual(client.call_tool.await_count, 2)
         self.assertEqual(managed.status, "ready")
         self.assertEqual(events[0]["type"], "browser_transport")
         self.assertEqual(events[0]["event"], "tool_failed")

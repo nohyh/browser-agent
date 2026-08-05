@@ -1,40 +1,75 @@
 import asyncio
 import json
 import unittest
-from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, MagicMock, Mock, call, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException
 from pydantic import ValidationError
 
-from app.agent import Agent
-from app.browser_process import (
-    get_chrome_cdp_candidates,
-    get_server_parameters,
-    run_agent_browser_cli,
-)
 from app.llm import AgentLLM
-from app.llm_provider import ProviderDecision
-from app.mcp_client import BrowserService, ManagedBrowserSession
-from app.models import AgentAction, AgentDecision, AgentResult
-from app.utils.tools import format_mcp_tools
+from app.models import AgentResult
 
 
 from tests.support import (
     FakeBrowser,
     FakeOpenAIClient,
-    FakeResponses,
     completed_decision,
-    continue_decision,
-    mcp_result,
-    mcp_tool,
-    ready_session_info,
 )
 
 class AgentApiTests(unittest.IsolatedAsyncioTestCase):
+    def test_stream_event_buffer_is_bounded_and_merges_duplicate_progress(self):
+        from app.api.agent import BoundedTraceQueue
+
+        queue = BoundedTraceQueue(maxsize=2)
+        event = {
+            "type": "trace",
+            "event": {
+                "kind": "thinking",
+                "status": "running",
+                "title": "正在分析页面并规划下一步",
+            },
+        }
+        queue.publish(event)
+        queue.publish(event.copy())
+        queue.publish({"type": "trace", "event": {"kind": "usage"}})
+        queue.publish({"type": "trace", "event": {"kind": "error"}})
+
+        self.assertLessEqual(queue.qsize(), 2)
+        self.assertEqual(queue.merged_count, 1)
+
+    async def test_health_endpoints_separate_process_liveness_and_runtime_readiness(self):
+        import main
+
+        live = await main.health_live()
+        self.assertEqual(live, {"status": "ok"})
+
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    runtime_supervisor=SimpleNamespace(
+                        snapshot=Mock(
+                            return_value={
+                                "status": "degraded",
+                                "ready": False,
+                                "last_error": "MCP unavailable",
+                            }
+                        )
+                    )
+                )
+            )
+        )
+        with self.assertRaises(HTTPException) as context:
+            await main.health_ready(request)
+
+        self.assertEqual(context.exception.status_code, 503)
+        self.assertEqual(
+            context.exception.detail["code"],
+            "runtime_not_ready",
+        )
+
     async def test_lifespan_closes_browsers_before_mcp_and_waits_for_llm_config(
         self,
     ):
@@ -89,6 +124,7 @@ class AgentApiTests(unittest.IsolatedAsyncioTestCase):
                 events.append("yield")
                 self.assertIsNone(test_app.state.agent_llm)
                 self.assertIsNone(test_app.state.openai_client)
+                await test_app.state.runtime_start_task
                 self.assertIs(test_app.state.browser_service, browser)
 
         client_factory.assert_not_called()
