@@ -11,6 +11,7 @@ from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
 from mcp import ClientSession
+from mcp.types import PaginatedRequestParams  # 显式导入 MCP 分页请求参数模型
 
 from app.browser.visual import VISUAL_OVERLAY_CLEANUP_SCRIPT
 from app.browser_process import (
@@ -803,9 +804,11 @@ class BrowserService:
         tools = []
         cursor = None
         while True:
-            page = await self.session.list_tools(cursor=cursor)
+            page = await self.session.list_tools(
+                params=PaginatedRequestParams(cursor=cursor) if cursor else None
+            )
             tools.extend(page.tools)
-            cursor = page.nextCursor
+            cursor = getattr(page, "next_cursor", getattr(page, "nextCursor", None))
             if cursor is None:
                 return tools
 
