@@ -85,7 +85,9 @@ class Agent:
 
     FRESH_RESULT_TEXT_LIMIT = 12_000
     FRESH_RESULT_COUNT_LIMIT = 3
-    RESULT_SUMMARY_PREVIEW_LIMIT = 800
+    # 对齐 browser-use 的思路：工具结果用完即弃，只保留摘要供“承上启下”。
+    FRESH_RESULT_PREVIEW_LIMIT = 1_500
+    RESULT_SUMMARY_PREVIEW_LIMIT = 300
     REPEATED_ACTION_LIMIT = 4
 
     def __init__(
@@ -140,8 +142,31 @@ class Agent:
         browser_session_id: str,
         trace_context: dict[str, str] | None = None,
     ) -> Any:
-        """获取当前页面的交互元素快照，作为本轮唯一页面状态。"""
+        """获取当前页面的交互元素快照，作为本轮唯一页面状态。
+
+        页面哈希未变化时复用缓存观察，跳过重复的 snapshot 工具调用，
+        避免同一页面在连续轮次中反复抓取大体积快照（Reddit 首页等可达数万字符）。
+        """
         trace_context = trace_context or {}
+        # 页面未变（上一轮快照哈希一致）且无待验证动作时，直接复用缓存观察
+        previous_hash = trace_context.get("previous_snapshot_hash")
+        if (
+            previous_hash
+            and trace_context.get("prefer_light") != "true"
+            and self._latest_observation is not None
+            and self._latest_observation.snapshot_hash == previous_hash
+        ):
+            observation_id = trace_context.get(
+                "action_id",
+                f"observation-{self._observation_revision + 1}",
+            )
+            return self._normalize_observation(
+                {
+                    **self._latest_observation.data,
+                    "reused": True,
+                },
+                observation_id,
+            )
         raw_observation = None
         if trace_context.get("prefer_light") == "true":
             observe_light = getattr(self.browser, "observe_page_state", None)
@@ -1208,6 +1233,7 @@ class Agent:
                 "truncated": len(retained_text) < len(source_text),
             }
             stored_item["_fresh"] = True
+            self._summarize_fresh_data(stored_item, safe_item)
         else:
             stored_item = self._compact_task_value(safe_item)
         if stored_item.get("type") == "agent_progress":
@@ -1245,6 +1271,35 @@ class Agent:
             "preview": text[: cls.RESULT_SUMMARY_PREVIEW_LIMIT],
         }
         item["data_compacted"] = True
+
+    @classmethod
+    def _summarize_fresh_data(
+        cls,
+        item: dict[str, Any],
+        source_item: dict[str, Any],
+    ) -> None:
+        """fresh 工具结果只保留摘要结构，完整正文不进入模型上下文。
+
+        对齐 browser-use 的“结果用完即弃、需要再读”思路：模型靠自身 memory
+        承上启下，细节缺失时再调用一次 read，而不是长期携带大体积正文。
+        仅对明显较大的结果做摘要；小结果（如点击成功）保持原样。
+        """
+        source_data = source_item.get("data")
+        if not isinstance(source_data, dict):
+            return
+        source_content = source_data.get("content")
+        if not isinstance(source_content, str):
+            return
+        if len(source_content) <= cls.FRESH_RESULT_TEXT_LIMIT:
+            return
+        data = item.get("data")
+        if not isinstance(data, dict):
+            return
+        preview = source_content[: cls.FRESH_RESULT_PREVIEW_LIMIT]
+        data["content"] = ""
+        data["preview"] = preview
+        data["characters"] = len(source_content)
+        item["data_summarized"] = True
 
     def _llm_task_context(self) -> list[dict[str, Any]]:
         """组合当前任务页面、工具结果和最新进度。"""

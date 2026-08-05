@@ -1726,6 +1726,63 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             len(tool_results[-1]["data"]["text"]),
         )
 
+    def test_fresh_tool_result_data_is_kept_lean(self):
+        """fresh 工具结果只保留摘要结构，不放完整正文（对齐 browser-use 用完即弃）。"""
+        agent = Agent(
+            task="inspect",
+            browser=FakeBrowser(),
+            llm=AgentLLM(FakeOpenAIClient([]), model="test-model"),
+        )
+        long_body = "BODY-BEGIN\n" + ("x" * 20_000) + "\nBODY-END"
+        stored = agent._append_task_context(
+            Agent._tool_outcome(
+                name="agent_browser_read",
+                arguments={"selector": "@e1"},
+                result={"data": {"title": "标题", "content": long_body}},
+            )
+        )
+
+        self.assertEqual(stored["type"], "tool_result")
+        self.assertIn("title", stored["data"])
+        self.assertEqual(len(stored["data"]["content"]), 0)
+        self.assertIn("characters", stored["data"])
+        self.assertGreaterEqual(stored["data"]["characters"], len(long_body))
+        self.assertIn("preview", stored["data"])
+        self.assertLessEqual(
+            len(stored["data"]["preview"]),
+            Agent.FRESH_RESULT_PREVIEW_LIMIT,
+        )
+        self.assertIn("BODY-BEGIN", stored["data"]["preview"])
+        self.assertNotIn("BODY-END", stored["data"]["preview"])
+
+    def test_summarized_old_result_keeps_only_digest(self):
+        """被挤出 fresh 区的旧结果只保留 sha256/字符数/短预览。"""
+        agent = Agent(
+            task="inspect",
+            browser=FakeBrowser(),
+            llm=AgentLLM(FakeOpenAIClient([]), model="test-model"),
+        )
+        stored = agent._append_task_context(
+            Agent._tool_outcome(
+                name="agent_browser_read",
+                arguments={},
+                result={"data": {"content": "x" * 10_000}},
+            )
+        )
+        self.assertTrue(stored["_fresh"])
+        agent._consume_fresh_results()
+
+        self.assertNotIn("_fresh", stored)
+        self.assertTrue(stored["data_compacted"])
+        self.assertEqual(
+            set(stored["data"]),
+            {"sha256", "characters", "preview"},
+        )
+        self.assertLessEqual(
+            len(stored["data"]["preview"]),
+            Agent.RESULT_SUMMARY_PREVIEW_LIMIT,
+        )
+
     async def test_click_without_page_change_is_reported_as_uncertain(self):
         browser = FakeBrowser(snapshot_values=["UNCHANGED", "UNCHANGED"])
         openai_client = FakeOpenAIClient(
@@ -2922,6 +2979,62 @@ class ObservationContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second["revision"], 2)
         self.assertNotEqual(first["observation_id"], second["observation_id"])
         self.assertEqual(first["snapshot_hash"] != second["snapshot_hash"], True)
+
+    async def test_unchanged_page_reuses_cached_observation(self):
+        """页面未变化时复用缓存观察，跳过重复 snapshot 工具调用。"""
+        browser = FakeBrowser(snapshot_values=["SAME-PAGE"])
+        agent = Agent(
+            task="inspect",
+            browser=browser,
+            llm=AgentLLM(FakeOpenAIClient([]), model="test-model"),
+        )
+
+        first = await agent.observe(
+            "browser-session-1",
+            {"action_id": "observation-1"},
+        )
+        self.assertEqual(browser.snapshot_count, 1)
+        self.assertNotIn("reused", first)
+
+        # 第二次观察传入上一轮快照哈希（页面未变化），应复用缓存、不再调用工具
+        second = await agent.observe(
+            "browser-session-1",
+            {
+                "action_id": "observation-2",
+                "previous_snapshot_hash": first["snapshot_hash"],
+            },
+        )
+
+        self.assertEqual(browser.snapshot_count, 1)
+        self.assertEqual(second["reused"], True)
+        self.assertEqual(second["snapshot_hash"], first["snapshot_hash"])
+        self.assertEqual(second["revision"], 2)
+
+    async def test_changed_page_still_refreshes_snapshot(self):
+        """页面哈希变化时仍走完整快照，不复用缓存。"""
+        browser = FakeBrowser(snapshot_values=["PAGE-A", "PAGE-B"])
+        agent = Agent(
+            task="inspect",
+            browser=browser,
+            llm=AgentLLM(FakeOpenAIClient([]), model="test-model"),
+        )
+
+        first = await agent.observe(
+            "browser-session-1",
+            {"action_id": "observation-1"},
+        )
+        # 传入错误的 previous hash（模拟页面已变化）
+        second = await agent.observe(
+            "browser-session-1",
+            {
+                "action_id": "observation-2",
+                "previous_snapshot_hash": "outdated-hash",
+            },
+        )
+
+        self.assertEqual(browser.snapshot_count, 2)
+        self.assertNotIn("reused", second)
+        self.assertNotEqual(second["snapshot_hash"], first["snapshot_hash"])
 
     async def test_stale_ref_is_rejected_before_browser_action(self):
         browser = FakeBrowser(snapshot_values=["PAGE", "PAGE-REFRESHED"])
