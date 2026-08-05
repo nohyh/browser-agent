@@ -1,8 +1,11 @@
 """Agent 任务执行、实时轨迹和取消服务。"""
 
 import asyncio
+import inspect
 import json
+from collections import deque
 from collections.abc import AsyncIterator, Callable
+from inspect import isawaitable
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +16,85 @@ from app.agent import Agent
 from app.api.schemas import AgentRunRequest
 from app.mcp_client import BrowserService
 from app.models import AgentResult
+
+
+STREAM_QUEUE_MAXSIZE = 64
+
+
+class BoundedTraceQueue:
+    """非阻塞、有界的公开轨迹缓冲；慢客户端不会拖住 Agent。"""
+
+    def __init__(self, maxsize: int = STREAM_QUEUE_MAXSIZE):
+        self.maxsize = max(1, maxsize)
+        self._items: deque[dict[str, Any]] = deque()
+        self._ready = asyncio.Event()
+        self.dropped_count = 0
+        self.merged_count = 0
+
+    def publish(self, event: dict[str, Any]) -> None:
+        if self._can_merge(event):
+            self._items[-1] = event
+            self.merged_count += 1
+            self._ready.set()
+            return
+        if len(self._items) >= self.maxsize:
+            self._items.popleft()
+            self.dropped_count += 1
+        self._items.append(event)
+        self._ready.set()
+
+    async def get(self) -> dict[str, Any]:
+        while not self._items:
+            self._ready.clear()
+            await self._ready.wait()
+        event = self._items.popleft()
+        if not self._items:
+            self._ready.clear()
+        return event
+
+    def empty(self) -> bool:
+        return not self._items
+
+    def qsize(self) -> int:
+        return len(self._items)
+
+    @staticmethod
+    def _is_mergeable(event: dict[str, Any]) -> bool:
+        if not event or event.get("type") != "trace":
+            return False
+        payload = event.get("event")
+        if not isinstance(payload, dict) or payload.get("kind") not in {
+            "thinking",
+            "action",
+        }:
+            return False
+        return True
+
+    def _same_progress(
+        self,
+        first: dict[str, Any],
+        second: dict[str, Any],
+    ) -> bool:
+        if not self._is_mergeable(first) or not self._is_mergeable(second):
+            return False
+        first_event = first["event"]
+        second_event = second["event"]
+        return (
+            first_event.get("kind"),
+            first_event.get("status"),
+            first_event.get("title"),
+            first_event.get("detail"),
+        ) == (
+            second_event.get("kind"),
+            second_event.get("status"),
+            second_event.get("title"),
+            second_event.get("detail"),
+        )
+
+    def _can_merge(self, event: dict[str, Any]) -> bool:  # type: ignore[override]
+        if not self._items:
+            return False
+        return self._same_progress(self._items[-1], event)
 
 
 async def _execute_agent_unlocked(
@@ -28,6 +110,14 @@ async def _execute_agent_unlocked(
     agent_llm = getattr(state, "agent_llm", None)
     if payload.llm_endpoint_id is not None and payload.llm_model is not None:
         registry = getattr(state, "llm_registry", None)
+        if registry is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "llm_selection_not_configured",
+                    "message": "模型配置尚未同步。",
+                },
+            )
         try:
             agent_llm = registry.resolve(payload.llm_endpoint_id, payload.llm_model)
         except (AttributeError, KeyError) as exc:
@@ -72,6 +162,7 @@ async def _execute_agent_unlocked(
             llm=agent_llm,
             trace_file=trace_dir / f"{payload.conversation_id}.md",
             event_sink=event_sink,
+            conversation_id=payload.conversation_id,
         )
         agents[payload.conversation_id] = agent
     else:
@@ -83,7 +174,22 @@ async def _execute_agent_unlocked(
         agent.add_user_message(payload.message)
 
     try:
-        return await agent.run(payload.browser_session_id)
+        run = agent.run
+        try:
+            run_parameters = inspect.signature(run).parameters.values()
+        except (TypeError, ValueError):
+            run_parameters = ()
+        supports_run_id = any(
+            parameter.name == "run_id"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in run_parameters
+        )
+        if supports_run_id:
+            return await run(
+                payload.browser_session_id,
+                run_id=payload.run_id,
+            )
+        return await run(payload.browser_session_id)
     finally:
         tracer = getattr(agent, "tracer", None)
         if tracer is not None:
@@ -131,11 +237,13 @@ def public_trace_event(record: dict[str, Any]) -> dict[str, Any] | None:
         }
     if event_type == "llm_result":
         output = record.get("output") or {}
-        actions = [
-            action.get("name")
-            for action in output.get("actions") or []
-            if isinstance(action, dict) and action.get("name")
-        ]
+        actions: list[str] = []
+        for action in output.get("actions") or []:
+            if not isinstance(action, dict):
+                continue
+            name = action.get("name")
+            if isinstance(name, str) and name:
+                actions.append(name)
         return {
             **common,
             "kind": "decision",
@@ -198,6 +306,25 @@ def stream_line(event: dict[str, Any]) -> str:
     return json.dumps(event, ensure_ascii=False, default=str) + "\n"
 
 
+async def _request_is_disconnected(request: Request) -> bool:
+    checker = getattr(request, "is_disconnected", None)
+    if not callable(checker):
+        return False
+    try:
+        result = checker()
+        return bool(await result) if isawaitable(result) else bool(result)
+    except Exception:
+        # 断线检查本身失败时继续让任务完成，避免误杀正常请求。
+        return False
+
+
+async def _cancel_agent_task(task: asyncio.Task[AgentResult]) -> None:
+    if task.done():
+        return
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
 async def stream_events(
     payload: AgentRunRequest,
     request: Request,
@@ -207,12 +334,13 @@ async def stream_events(
     active_runs: dict[str, asyncio.Task[AgentResult]],
 ) -> AsyncIterator[str]:
     """生成一条任务的 NDJSON 事件流，并负责清理运行登记。"""
-    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    queue = BoundedTraceQueue()
+    client_disconnected = False
 
     def publish(record: dict[str, Any]) -> None:
         event = public_trace_event(record)
         if event is not None:
-            queue.put_nowait({"type": "trace", "event": event})
+            queue.publish({"type": "trace", "event": event})
 
     task = asyncio.create_task(
         execute_agent(
@@ -227,6 +355,10 @@ async def stream_events(
     yield stream_line({"type": "run_started", "run_id": payload.run_id})
     try:
         while not task.done() or not queue.empty():
+            if await _request_is_disconnected(request):
+                client_disconnected = True
+                await _cancel_agent_task(task)
+                return
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=0.1)
             except TimeoutError:
@@ -235,9 +367,9 @@ async def stream_events(
         result = await task
         yield stream_line({"type": "result", "result": result.model_dump()})
     except asyncio.CancelledError:
-        if not task.done():
-            task.cancel()
-        yield stream_line({"type": "cancelled", "run_id": payload.run_id})
+        await _cancel_agent_task(task)
+        if not client_disconnected:
+            yield stream_line({"type": "cancelled", "run_id": payload.run_id})
     except HTTPException as exc:
         yield stream_line(
             {"type": "error", "status": exc.status_code, "detail": exc.detail}
@@ -251,8 +383,11 @@ async def stream_events(
             }
         )
     finally:
+        if client_disconnected:
+            await _cancel_agent_task(task)
         active_runs.pop(payload.run_id, None)
-    yield stream_line({"type": "done", "run_id": payload.run_id})
+    if not client_disconnected:
+        yield stream_line({"type": "done", "run_id": payload.run_id})
 
 
 async def stream_agent_run(

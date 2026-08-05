@@ -11,6 +11,7 @@ from fastapi import Depends, FastAPI, Request
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
 from openai import AsyncOpenAI
+from pydantic import SecretStr
 
 from app.api import agent as agent_api
 from app.api import browser as browser_api
@@ -21,8 +22,6 @@ from app.api.schemas import (
     BrowserSessionStartRequest,
     LLMConfigRequest,
     LLMConfigResult,
-    LLMEndpointConfigRequest,
-    LLMEndpointConfigResult,
     LLMEndpointsConfigRequest,
     LLMEndpointsConfigResult,
     LLMModelDiscoveryRequest,
@@ -33,13 +32,28 @@ from app.api.schemas import (
 from app.browser_process import get_server_parameters
 from app.llm import AgentLLM
 from app.llm_registry import LLMRegistry
-from app.mcp_client import BrowserService, ManagedBrowserSession
+from app.mcp_client import BrowserService
 from app.models import AgentResult
-from app.trace import TraceRecorder
+from app.runtime_supervisor import BrowserRuntimeSupervisor
+from app.trace import (
+    DEFAULT_TRACE_MAX_TOTAL_BYTES,
+    DEFAULT_TRACE_RETENTION_DAYS,
+    TraceRecorder,
+    cleanup_trace_directory,
+)
 
 
 CONVERSATION_TRACE_DIR = Path(__file__).parent / "logs" / "conversations"
 BROWSER_SESSION_TRACE_FILE = Path(__file__).parent / "logs" / "browser-sessions.md"
+TRACE_RETENTION_DAYS = int(
+    os.getenv("BROWSER_AGENT_TRACE_RETENTION_DAYS", DEFAULT_TRACE_RETENTION_DAYS)
+)
+TRACE_MAX_TOTAL_BYTES = int(
+    os.getenv(
+        "BROWSER_AGENT_TRACE_MAX_TOTAL_BYTES",
+        DEFAULT_TRACE_MAX_TOTAL_BYTES,
+    )
+)
 
 # 保留这些入口，避免已有脚本因内部模块拆分而失效。
 llm_config_fingerprint = llm_api.llm_config_fingerprint
@@ -50,8 +64,28 @@ stream_line = agent_api.stream_line
 
 
 @asynccontextmanager
+async def browser_runtime_context():
+    """创建一个可由 supervisor 重建的 MCP/browser runtime。"""
+    params = get_server_parameters()
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            session_tracer = TraceRecorder(
+                BROWSER_SESSION_TRACE_FILE,
+                retain_events=False,
+            )
+            browser = BrowserService(
+                session,
+                lifecycle_sink=session_tracer.record,
+            )
+            await browser.cleanup_orphaned_sessions()
+            await browser.cache_tools()
+            yield browser
+
+
+@asynccontextmanager
 async def lifespan(app: FastAPI):
-    """在应用生命周期内复用 OpenAI 和 MCP 客户端。"""
+    """API 先存活，再由后台任务初始化 MCP 客户端。"""
     load_dotenv()
     api_key = os.getenv("OPENAI_API_KEY")
     model = os.getenv("OPENAI_MODEL")
@@ -62,12 +96,28 @@ async def lifespan(app: FastAPI):
     app.state.llm_registry = LLMRegistry()
     app.state.active_runs = {}
     app.state.agent_locks = {}
+    app.state.browser_service = None
+
+    # 清理放在进程启动阶段，避免在用户请求路径同步扫描全部历史日志。
+    for trace_directory in {
+        CONVERSATION_TRACE_DIR,
+        BROWSER_SESSION_TRACE_FILE.parent,
+    }:
+        try:
+            await asyncio.to_thread(
+                cleanup_trace_directory,
+                trace_directory,
+                retention_days=TRACE_RETENTION_DAYS,
+                max_total_bytes=TRACE_MAX_TOTAL_BYTES,
+            )
+        except Exception:
+            pass
 
     # 环境变量仍可作为默认配置；缺失时等待前端通过接口配置。
     if api_key and model:
         initial_config = LLMConfigRequest(
             api_url=os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1",
-            api_key=api_key,
+            api_key=SecretStr(api_key),
             model=model,
         )
         openai_client = AsyncOpenAI(
@@ -82,33 +132,28 @@ async def lifespan(app: FastAPI):
         )
         app.state.llm_config_fingerprint = llm_config_fingerprint(initial_config)
 
-    params = get_server_parameters()
+    supervisor = BrowserRuntimeSupervisor(browser_runtime_context)
+    app.state.runtime_supervisor = supervisor
+
+    async def start_runtime() -> None:
+        await supervisor.start()
+        app.state.browser_service = supervisor.service
+
+    runtime_start_task = asyncio.create_task(start_runtime())
+    app.state.runtime_start_task = runtime_start_task
     try:
-        async with stdio_client(params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                session_tracer = TraceRecorder(
-                    BROWSER_SESSION_TRACE_FILE,
-                    retain_events=False,
-                )
-                browser = BrowserService(
-                    session,
-                    lifecycle_sink=session_tracer.record,
-                )
-                await browser.cleanup_orphaned_sessions()
-                await browser.cache_tools()
-                app.state.browser_service = browser
-                try:
-                    yield
-                finally:
-                    active_runs = list(app.state.active_runs.values())
-                    for task in active_runs:
-                        task.cancel()
-                    if active_runs:
-                        await asyncio.gather(*active_runs, return_exceptions=True)
-                    # 必须在 MCP 连接退出前关闭浏览器 runtime。
-                    await browser.close_all_sessions()
+        yield
     finally:
+        active_runs = list(app.state.active_runs.values())
+        for task in active_runs:
+            task.cancel()
+        if active_runs:
+            await asyncio.gather(*active_runs, return_exceptions=True)
+        if not runtime_start_task.done():
+            runtime_start_task.cancel()
+        await asyncio.gather(runtime_start_task, return_exceptions=True)
+        await supervisor.stop()
+        app.state.browser_service = None
         llm_registry = getattr(app.state, "llm_registry", None)
         if llm_registry is not None:
             await llm_registry.close()
@@ -122,11 +167,28 @@ app = FastAPI(title="Browser Agent Backend", lifespan=lifespan)
 
 def get_browser_service(request: Request) -> BrowserService:
     """从应用状态中取得已初始化的浏览器服务。"""
-    service = getattr(request.app.state, "browser_service", None)
+    supervisor = getattr(request.app.state, "runtime_supervisor", None)
+    service = (
+        supervisor.service
+        if supervisor is not None
+        else getattr(request.app.state, "browser_service", None)
+    )
     if service is None:
         from fastapi import HTTPException
 
-        raise HTTPException(status_code=500, detail="MCP session not initialized")
+        snapshot = (
+            supervisor.snapshot()
+            if supervisor is not None
+            else {"status": "degraded", "last_error": "MCP session not initialized"}
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "runtime_not_ready",
+                "message": "Browser runtime is not ready.",
+                **snapshot,
+            },
+        )
     return service
 
 
@@ -134,8 +196,43 @@ BrowserDep = Annotated[BrowserService, Depends(get_browser_service)]
 
 
 @app.get("/health")
-async def health():
+async def health(request: Request):
+    supervisor = getattr(request.app.state, "runtime_supervisor", None)
+    return {
+        "status": "ok",
+        "runtime": (
+            supervisor.snapshot()
+            if supervisor is not None
+            else {"status": "unknown", "ready": False}
+        ),
+    }
+
+
+@app.get("/health/live")
+async def health_live():
     return {"status": "ok"}
+
+
+@app.get("/health/ready")
+async def health_ready(request: Request):
+    supervisor = getattr(request.app.state, "runtime_supervisor", None)
+    snapshot = (
+        supervisor.snapshot()
+        if supervisor is not None
+        else {"status": "degraded", "ready": False, "last_error": "MCP session not initialized"}
+    )
+    if snapshot.get("ready") is True:
+        return snapshot
+    from fastapi import HTTPException
+
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "code": "runtime_not_ready",
+            "message": "Browser runtime is not ready.",
+            **snapshot,
+        },
+    )
 
 
 @app.put("/llm/config", response_model=LLMConfigResult)

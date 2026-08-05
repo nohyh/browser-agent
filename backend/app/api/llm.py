@@ -33,7 +33,7 @@ def parse_page_suggestions(value: str, limit: int) -> list[str]:
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned)
 
-    candidates: list[object]
+    candidates: list[Any]
     try:
         parsed = json.loads(cleaned)
         if isinstance(parsed, dict):

@@ -1,8 +1,117 @@
 """浏览器 Agent 的结构化输入输出模型。"""
 
 from typing import Any, Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, Field, model_validator
+
+
+MutationStatus = Literal[
+    "prepared",
+    "dispatched",
+    "uncertain",
+    "confirmed",
+    "failed",
+]
+
+
+class ToolBehavior(BaseModel):
+    """工具执行前需要知道的最小安全元数据。"""
+
+    name: str
+    category: Literal["read_only", "navigation", "potential_write"] = (
+        "potential_write"
+    )
+    changes_page: bool = True
+    terminates_sequence: bool = True
+    retry_policy: Literal["none", "read_once", "observe"] = "none"
+    result_visibility: Literal["context", "hidden"] = "context"
+
+    @property
+    def read_only(self) -> bool:
+        return self.category == "read_only"
+
+    @property
+    def potential_write(self) -> bool:
+        return self.category == "potential_write"
+
+
+class ActionEffect(BaseModel):
+    """一次工具动作在页面观察中的可验证效果。"""
+
+    dispatched: bool = False
+    page_changed: bool | None = None
+    url_changed: bool | None = None
+    snapshot_changed: bool | None = None
+    observation_id: str | None = None
+    observation_revision: int | None = None
+    confirmed: bool = False
+
+
+class ToolOutcome(BaseModel):
+    """MCP 工具调用对 Agent 暴露的统一结果 envelope。"""
+
+    type: Literal["tool_result"] = "tool_result"
+    action_id: str | None = None
+    name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    status: Literal["succeeded", "failed", "uncertain"]
+    data: Any = None
+    error: dict[str, Any] | str | None = None
+    effect: ActionEffect = Field(default_factory=ActionEffect)
+
+
+class StepFailure(BaseModel):
+    """可供下一轮决策使用的结构化步骤失败。"""
+
+    stage: Literal[
+        "provider",
+        "browser",
+        "tool",
+        "validation",
+        "completion",
+        "runtime",
+        "loop",
+        "cancelled",
+    ]
+    code: str
+    retryable: bool = False
+    uncertain: bool = False
+    message: str
+    attempt: int = 1
+    observation_id: str | None = None
+    observation_revision: int | None = None
+
+
+class MutationIntent(BaseModel):
+    """潜在写操作的生命周期记录，防止恢复或重试时重复执行。"""
+
+    mutation_id: str = Field(default_factory=lambda: f"mutation-{uuid4()}")
+    action_id: str
+    tool_name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    status: MutationStatus = "prepared"
+    page_url: str | None = None
+    prepared_at: float | None = None
+    dispatched_at: float | None = None
+    effect: ActionEffect | None = None
+    error: dict[str, Any] | str | None = None
+
+
+class BrowserObservation(BaseModel):
+    """带版本的页面观察；原始 MCP 结构可以继续放在 data 中。"""
+
+    observation_id: str
+    revision: int
+    url: str | None = None
+    title: str | None = None
+    tabs: list[dict[str, Any]] = Field(default_factory=list)
+    snapshot: str | None = None
+    snapshot_hash: str | None = None
+    source_characters: int = 0
+    sent_characters: int = 0
+    stability: Literal["unknown", "stable", "unstable", "empty"] = "unknown"
+    data: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentAction(BaseModel):
@@ -10,6 +119,8 @@ class AgentAction(BaseModel):
 
     name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
+    observation_id: str | None = None
+    observation_revision: int | None = None
 
 
 class AgentDecision(BaseModel):

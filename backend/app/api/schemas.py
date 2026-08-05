@@ -238,6 +238,13 @@ class BrowserSessionResult(BaseModel):
     browser_session_id: str
     mode: Literal["current", "isolated", "existing"]
     ownership: Literal["backend", "external"]
-    status: Literal["starting", "ready", "disconnected", "error", "closed"]
+    status: Literal[
+        "starting",
+        "recovering",
+        "ready",
+        "disconnected",
+        "error",
+        "closed",
+    ]
     ready: bool
     url: str | None

@@ -14,10 +14,24 @@ from mcp import ClientSession
 from mcp.types import PaginatedRequestParams  # 显式导入 MCP 分页请求参数模型
 
 from app.browser.visual import VISUAL_OVERLAY_CLEANUP_SCRIPT
+from app.browser_launcher import BrowserLauncher
 from app.browser_process import (
     get_chrome_cdp_candidates,
     run_agent_browser_cli,
 )
+from app.models import ToolBehavior
+from app.session_registry import SessionRegistry
+from app.utils.errors import ToolValidationError
+
+
+__all__ = [
+    "BrowserService",
+    "BrowserSessionDisconnected",
+    "BrowserToolTimeout",
+    "ManagedBrowserSession",
+    "ToolValidationError",
+]
+from app.utils.tools import get_tool_behavior, validate_tool_arguments
 
 
 BROWSER_TOOL_TIMEOUT_SECONDS = 30
@@ -41,7 +55,7 @@ RUNTIME_DISCONNECT_MARKERS = (
 class BrowserToolTimeout(TimeoutError):
     """可被 Agent 和 API 稳定识别的 MCP 工具超时。"""
 
-    code = "browser_tool_timeout"
+    code = "tool_timeout"
     retryable = True
 
     def __init__(
@@ -54,7 +68,7 @@ class BrowserToolTimeout(TimeoutError):
     ):
         self.tool_name = tool_name
         self.timeout_seconds = timeout_seconds
-        self.phase = phase
+        self.phase: Literal["mcp_response", "agent_browser"] = phase
         self.duration_ms = duration_ms
         super().__init__(
             f"{tool_name} timed out after {timeout_seconds} seconds"
@@ -70,6 +84,45 @@ class BrowserToolTimeout(TimeoutError):
             "phase": self.phase,
             "duration_ms": self.duration_ms,
             "retryable": self.retryable,
+        }
+
+
+class BrowserSessionDisconnected(RuntimeError):
+    """恢复 runtime 后不再透明重放的浏览器调用。"""
+
+    def __init__(
+        self,
+        tool_name: str,
+        behavior: ToolBehavior,
+        *,
+        recovered: bool,
+        cause: Exception,
+    ):
+        self.tool_name = tool_name
+        self.behavior = behavior
+        self.recovered = recovered
+        self.uncertain = behavior.potential_write
+        self.retryable = behavior.category != "potential_write"
+        self.code = (
+            "action_uncertain"
+            if self.uncertain
+            else "session_disconnected"
+        )
+        self.cause = cause
+        super().__init__(
+            f"{tool_name} was not replayed after browser runtime recovery: "
+            f"{cause}"
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "type": type(self).__name__,
+            "code": self.code,
+            "message": str(self),
+            "tool_name": self.tool_name,
+            "retryable": self.retryable,
+            "uncertain": self.uncertain,
+            "recovered": self.recovered,
         }
 
 
@@ -103,10 +156,17 @@ class ManagedBrowserSession:
 
 def unwrap(result: Any) -> Any:
     """统一解析 MCP 调用结果，并将协议错误转换为 Python 异常。"""
-    structured = getattr(result, "structuredContent", None) or {}
+    # MCP Python SDK 使用 snake_case 字段；保留旧 alias 兼容现有客户端和 fake。
+    structured = getattr(result, "structured_content", None)
+    if structured is None:
+        structured = getattr(result, "structuredContent", None)
+    structured = structured or {}
     response = structured.get("response")
 
-    if getattr(result, "isError", False):
+    is_error = getattr(result, "is_error", None)
+    if is_error is None:
+        is_error = getattr(result, "isError", False)
+    if is_error:
         text = "\n".join(
             item.text for item in getattr(result, "content", [])
             if getattr(item, "type", None) == "text"
@@ -130,15 +190,22 @@ class BrowserService:
         self,
         session: ClientSession,
         lifecycle_sink: Callable[[dict[str, Any]], None] | None = None,
+        launcher: BrowserLauncher | None = None,
     ):
         self.session = session
         self.lifecycle_sink = lifecycle_sink
+        self.launcher = launcher or BrowserLauncher(
+            cli=lambda *arguments: run_agent_browser_cli(*arguments),
+            cdp_candidates=lambda: get_chrome_cdp_candidates(),
+        )
+        self.registry = SessionRegistry()
         # 完整工具 schema 只缓存于后端，不直接发送给 LLM。
         self.tools: List[Any] = []
-        self.sessions: dict[str, ManagedBrowserSession] = {}
-        self._cdp_owners: dict[str, str] = {}
-        self._registry_lock = asyncio.Lock()
-        self._session_locks: dict[str, asyncio.Lock] = {}
+        # 保留旧属性，便于现有调用方和测试逐步迁移到 registry。
+        self.sessions = self.registry.sessions
+        self._cdp_owners = self.registry.cdp_owners
+        self._registry_lock = self.registry.lock
+        self._session_locks = self.registry.session_locks
         self._tool_locks: dict[str, asyncio.Lock] = {}
 
     def _emit_lifecycle(
@@ -252,7 +319,7 @@ class BrowserService:
             else:
                 assert managed.cdp_url is not None
                 command = ["connect", managed.cdp_url]
-            return await run_agent_browser_cli(
+            return await self.launcher.run(
                 "--session",
                 managed.runtime_session_id,
                 *command,
@@ -276,7 +343,7 @@ class BrowserService:
         )
 
     async def _start_isolated_runtime(self, managed: ManagedBrowserSession) -> Any:
-        response = await run_agent_browser_cli(
+        response = await self.launcher.run(
             "--session",
             managed.runtime_session_id,
             "open",
@@ -285,7 +352,7 @@ class BrowserService:
         )
         if os.name == "nt":
             try:
-                cdp_response = await run_agent_browser_cli(
+                cdp_response = await self.launcher.run(
                     "--session",
                     managed.runtime_session_id,
                     "get",
@@ -309,9 +376,9 @@ class BrowserService:
         selected_cdp_url = None
         tabs: list[dict[str, Any]] = []
         connected = False
-        for cdp_url in get_chrome_cdp_candidates():
+        for cdp_url in self.launcher.cdp_candidates():
             try:
-                tabs_response = await run_agent_browser_cli(
+                tabs_response = await self.launcher.run(
                     "--session",
                     managed.runtime_session_id,
                     "--cdp",
@@ -359,7 +426,7 @@ class BrowserService:
         target_id = target.get("tabId")
         if not isinstance(target_id, str):
             raise RuntimeError("current Chrome returned an invalid target tab")
-        response = await run_agent_browser_cli(
+        response = await self.launcher.run(
             "--session",
             managed.runtime_session_id,
             "--cdp",
@@ -423,7 +490,7 @@ class BrowserService:
 
     async def _close_runtime(self, managed: ManagedBrowserSession) -> Any:
         if os.name == "nt":
-            return await run_agent_browser_cli(
+            return await self.launcher.run(
                 "--session",
                 managed.runtime_session_id,
                 "close",
@@ -445,25 +512,13 @@ class BrowserService:
 
     def _claim_cdp_target(self, managed: ManagedBrowserSession) -> None:
         """同一 CDP 目标只允许一个后端逻辑会话控制。"""
-        if managed.cdp_url is None:
-            return
-        owner = self._cdp_owners.get(managed.cdp_url)
-        if owner is not None and owner != managed.browser_session_id:
-            raise ValueError(f"CDP target is already controlled by '{owner}'")
-        self._cdp_owners[managed.cdp_url] = managed.browser_session_id
+        self.registry.claim_cdp_target(managed)
 
     async def _release_cdp_target(
         self,
         managed: ManagedBrowserSession,
     ) -> None:
-        if managed.cdp_url is None:
-            return
-        async with self._registry_lock:
-            if (
-                self._cdp_owners.get(managed.cdp_url)
-                == managed.browser_session_id
-            ):
-                self._cdp_owners.pop(managed.cdp_url, None)
+        await self.registry.release_cdp_target(managed)
 
     async def _call_runtime_tool(
         self,
@@ -662,17 +717,7 @@ class BrowserService:
         managed: ManagedBrowserSession,
     ) -> None:
         """只清理当前记录，避免失败任务误删后来创建的同名会话。"""
-        async with self._registry_lock:
-            if self.sessions.get(managed.browser_session_id) is managed:
-                self.sessions.pop(managed.browser_session_id, None)
-            if (
-                managed.cdp_url is not None
-                and self._cdp_owners.get(managed.cdp_url)
-                == managed.browser_session_id
-            ):
-                self._cdp_owners.pop(managed.cdp_url, None)
-        managed.status = "closed"
-        managed.page_count = 0
+        await self.registry.forget(managed)
 
     def is_session_ready(self, browser_session_id: str) -> bool:
         """判断浏览器会话是否已经完成启动和 MCP 探测。"""
@@ -770,7 +815,7 @@ class BrowserService:
 
     async def cleanup_orphaned_sessions(self) -> list[str]:
         """清理上次异常退出遗留的本项目 runtime 会话。"""
-        response = await run_agent_browser_cli(
+        response = await self.launcher.run(
             "session",
             "list",
             "--json",
@@ -791,7 +836,7 @@ class BrowserService:
             )
         )
         for session_id in orphaned:
-            await run_agent_browser_cli(
+            await self.launcher.run(
                 "--session",
                 session_id,
                 "close",
@@ -817,11 +862,56 @@ class BrowserService:
         self.tools = await self.list_tools()
         return self.tools
 
+    async def observe_page_state(
+        self,
+        browser_session_id: str,
+        *,
+        previous_snapshot_hash: str | None = None,
+    ) -> dict[str, Any] | None:
+        """读取轻量页面状态，并在可用时返回 diff snapshot。"""
+        tool_names = {getattr(tool, "name", None) for tool in self.tools}
+        if "agent_browser_diff_snapshot" not in tool_names:
+            return None
+        state: dict[str, Any] = {"observation_kind": "diff"}
+        for name, key in (
+            ("agent_browser_get_url", "url"),
+            ("agent_browser_get_title", "title"),
+        ):
+            if name not in tool_names:
+                continue
+            try:
+                response = await self.call_tool(
+                    browser_session_id,
+                    name,
+                    {},
+                )
+            except Exception:
+                return None
+            value = response.get("data") if isinstance(response, dict) else None
+            if isinstance(value, dict):
+                value = value.get(key)
+            if isinstance(value, str) and value:
+                state[key] = value
+        try:
+            diff = await self.call_tool(
+                browser_session_id,
+                "agent_browser_diff_snapshot",
+                {"interactive": True, "compact": True},
+            )
+        except Exception:
+            return None
+        if isinstance(diff, dict):
+            state.update(diff)
+        if previous_snapshot_hash is not None:
+            state["previous_snapshot_hash"] = previous_snapshot_hash
+        return state
+
     async def call_tool(
         self,
         browser_session_id: str,
         name: str,
         arguments: dict,
+        behavior: ToolBehavior | None = None,
     ) -> Any:
         """调用浏览器工具，并强制注入当前逻辑浏览器会话。"""
         managed = self.sessions.get(browser_session_id)
@@ -832,11 +922,21 @@ class BrowserService:
 
         # session 和外部 CDP 均由后端注入，模型不能跨浏览器或触发本地回退。
         tool_arguments = dict(arguments)
+        tool = next(
+            (
+                candidate
+                for candidate in self.tools
+                if getattr(candidate, "name", None) == name
+            ),
+            None,
+        )
+        behavior = behavior or get_tool_behavior(name, tool)
         tool_lock = self._tool_locks.setdefault(
             browser_session_id,
             asyncio.Lock(),
         )
         async with tool_lock:
+            validate_tool_arguments(name, tool_arguments, self.tools)
             try:
                 response = await self._call_runtime_tool(
                     name,
@@ -846,6 +946,13 @@ class BrowserService:
                 if not self._should_recover_runtime(managed, exc):
                     raise
                 await self._recover_runtime(managed, exc)
+                if behavior.retry_policy != "read_once":
+                    raise BrowserSessionDisconnected(
+                        name,
+                        behavior,
+                        recovered=True,
+                        cause=exc,
+                    ) from exc
                 try:
                     response = await self._call_runtime_tool(
                         name,

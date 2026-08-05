@@ -1,5 +1,5 @@
-mcp>=1.0.0
-openai>=1.73.0
-python-dotenv>=1.0.0
-fastapi>=0.100.0
-uvicorn>=0.20.0
+mcp==2.0.0
+openai==2.52.0
+python-dotenv==1.2.2
+fastapi==0.141.1
+uvicorn==0.52.0

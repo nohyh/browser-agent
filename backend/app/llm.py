@@ -6,7 +6,8 @@ import asyncio
 import hashlib
 import json
 import re
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable
 
 from app.llm_provider import OpenAIResponsesAdapter, ProviderAdapter
 from app.models import AgentDecision, AgentTokenUsage
@@ -14,10 +15,6 @@ from app.trace import redact_value
 from app.utils.errors import is_transient_error
 from app.utils.tools import format_mcp_tools
 from app.utils.values import compact_value
-
-if TYPE_CHECKING:
-    from openai import AsyncOpenAI
-
 
 BROWSER_AGENT_SYSTEM_PROMPT = """
 你是一个在持续决策循环中工作的浏览器自动化 Agent。你的最终目标是准确完成用户当前提出的任务，并用与用户相同的语言返回结果。
@@ -128,6 +125,52 @@ blocked 的最终答案必须说明任务尚未完成、阻塞证据、已有结
 LLM_REQUEST_TIMEOUT_SECONDS = 30
 
 
+@dataclass(frozen=True)
+class TokenEstimator:
+    """无 tokenizer 时使用的保守字符比例估算器。"""
+
+    chars_per_token: int = 4
+
+    def __post_init__(self) -> None:
+        if self.chars_per_token <= 0:
+            raise ValueError("chars_per_token must be positive")
+
+    def estimate(self, value: Any) -> int:
+        characters = len(value) if isinstance(value, str) else len(
+            json.dumps(value, ensure_ascii=False, default=str)
+        )
+        return (characters + self.chars_per_token - 1) // self.chars_per_token
+
+    def slot_metrics(
+        self,
+        *,
+        system: Any,
+        history: Any,
+        observation: Any,
+        tool_result: Any,
+    ) -> dict[str, dict[str, int | bool]]:
+        budgets = {
+            "system": 4_000,
+            "history": 2_500,
+            "observation": 5_000,
+            "tool_result": 3_000,
+        }
+        values = {
+            "system": system,
+            "history": history,
+            "observation": observation,
+            "tool_result": tool_result,
+        }
+        return {
+            name: {
+                "estimated_tokens": self.estimate(values[name]),
+                "budget_tokens": budget,
+                "over_budget": self.estimate(values[name]) > budget,
+            }
+            for name, budget in budgets.items()
+        }
+
+
 class AgentLLMCallError(RuntimeError):
     """携带失败调用观测数据，同时保留底层异常类型和消息。"""
 
@@ -165,10 +208,11 @@ class AgentLLM:
     CONVERSATION_CONTEXT_LIMIT = 12_000
     CONVERSATION_SUMMARY_LIMIT = 2_000
     MESSAGE_LIMIT = 10
+    token_estimator = TokenEstimator()
 
     def __init__(
         self,
-        client: AsyncOpenAI,
+        client: Any,
         model: str,
         provider_adapter: ProviderAdapter | None = None,
         endpoint_id: str = "default",
@@ -559,6 +603,19 @@ class AgentLLM:
                 ),
                 task_context_characters=task_context_characters,
             )
+        # 兼容端点常不返回细节字段；缺失时按 0 处理，避免失败路径二次崩溃。
+        input_details = getattr(usage, "input_tokens_details", None)
+        output_details = getattr(usage, "output_tokens_details", None)
+        cached_input_tokens = 0
+        if input_details is not None:
+            cached_input_tokens = (
+                getattr(input_details, "cached_tokens", 0) or 0
+            )
+        reasoning_tokens = 0
+        if output_details is not None:
+            reasoning_tokens = (
+                getattr(output_details, "reasoning_tokens", 0) or 0
+            )
         return AgentTokenUsage(
             llm_calls=llm_calls,
             failed_llm_calls=failed_llm_calls,
@@ -570,8 +627,8 @@ class AgentLLM:
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             total_tokens=usage.total_tokens,
-            cached_input_tokens=usage.input_tokens_details.cached_tokens,
-            reasoning_tokens=usage.output_tokens_details.reasoning_tokens,
+            cached_input_tokens=cached_input_tokens,
+            reasoning_tokens=reasoning_tokens,
             input_characters=input_characters,
             observation_characters=observation_characters,
             observation_source_characters=(
@@ -603,6 +660,25 @@ class AgentLLM:
             task_context_text,
         )
 
+    @classmethod
+    def token_slot_metrics(
+        cls,
+        *,
+        observation: Any,
+        messages: list[dict[str, str]],
+        task_context: list[dict[str, Any]],
+        system_prompt: str = "",
+    ) -> dict[str, dict[str, int | bool]]:
+        estimator = cls.token_estimator
+        return estimator.slot_metrics(
+            system=system_prompt,
+            history=messages,
+            observation=cls._format_observation(observation),
+            tool_result=cls._format_task_context(task_context)
+            if task_context
+            else "(none)",
+        )
+
     @staticmethod
     def _formatted_input_metrics(
         observation_text: str,
@@ -632,6 +708,7 @@ class AgentLLM:
         """优先保留有顺序的 snapshot，移除与其重复且无顺序的 refs。"""
         if isinstance(observation, dict):
             payload = observation
+            metadata_source = observation
             data = observation.get("data")
             if isinstance(data, dict):
                 payload = data
@@ -645,7 +722,17 @@ class AgentLLM:
                     "snapshot",
                 )
                 digest = hashlib.sha256(snapshot.encode("utf-8")).hexdigest()
-                formatted["observation_id"] = digest[:16]
+                formatted["observation_id"] = (
+                    metadata_source.get("observation_id")
+                    or payload.get("observation_id")
+                    or digest[:16]
+                )
+                revision = metadata_source.get(
+                    "revision",
+                    payload.get("revision"),
+                )
+                if revision is not None:
+                    formatted["revision"] = revision
                 formatted["snapshot_meta"] = {
                     "sha256": digest,
                     "source_characters": len(snapshot),

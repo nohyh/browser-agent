@@ -2,26 +2,37 @@
 
 import asyncio
 import hashlib
+import inspect
 import json
 import re
+import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from app.llm import AgentLLM
 from app.browser.visual import BrowserVisualController
 from app.mcp_client import BrowserService
 from app.models import (
+    ActionEffect,
     AgentAction,
     AgentDecision,
     AgentResult,
     AgentTokenUsage,
+    BrowserObservation,
+    MutationIntent,
+    MutationStatus,
+    StepFailure,
+    ToolOutcome,
 )
-from app.trace import TraceRecorder, redact_value
+from app.trace import TraceRecorder, redact_tool_arguments, redact_value
 from app.utils.errors import exception_details
 from app.utils.tools import (
     REGISTERED_TOOL_NAMES,
     TOOL_GETTER_NAMES,
+    get_tool_behavior,
     get_tool_group,
+    format_mcp_tools,
+    repetition_limit,
     select_mcp_tools_for_llm,
 )
 from app.utils.values import compact_value, extract_snapshot
@@ -75,7 +86,7 @@ class Agent:
     FRESH_RESULT_TEXT_LIMIT = 12_000
     FRESH_RESULT_COUNT_LIMIT = 3
     RESULT_SUMMARY_PREVIEW_LIMIT = 800
-    REPEATED_ACTION_LIMIT = 3
+    REPEATED_ACTION_LIMIT = 4
 
     def __init__(
         self,
@@ -85,6 +96,7 @@ class Agent:
         max_steps: int = 20,
         trace_file: Path | None = None,
         event_sink: Callable[[dict[str, Any]], None] | None = None,
+        conversation_id: str | None = None,
     ):
         initial_message = {"role": "user", "content": task}
         # messages 保存完整对话；task_context 只保存当前任务的运行信息。
@@ -100,6 +112,7 @@ class Agent:
             trace_file,
             self._tool_outcome,
             event_sink=event_sink,
+            conversation_id=conversation_id,
         )
         self._record({"type": "message", **initial_message})
         self.browser = browser
@@ -109,6 +122,11 @@ class Agent:
         self._run_count = 0
         self._last_action_signature: str | None = None
         self._repeated_action_count = 0
+        self._pending_mutations: dict[str, MutationIntent] = {}
+        self._observation_revision = 0
+        self._latest_observation = None
+        self._task_mode = "read_only"
+        self._last_action_outcome: dict[str, Any] | None = None
 
     @property
     def trace(self) -> list[dict[str, Any]]:
@@ -123,12 +141,38 @@ class Agent:
         trace_context: dict[str, str] | None = None,
     ) -> Any:
         """获取当前页面的交互元素快照，作为本轮唯一页面状态。"""
-        return await self._call_tool(
-            browser_session_id=browser_session_id,
-            name="agent_browser_snapshot",
-            arguments={"interactive": True, "compact": True},
-            trace_context=trace_context,
+        trace_context = trace_context or {}
+        raw_observation = None
+        if trace_context.get("prefer_light") == "true":
+            observe_light = getattr(self.browser, "observe_page_state", None)
+            if callable(observe_light):
+                light_result = observe_light(
+                    browser_session_id,
+                    previous_snapshot_hash=trace_context.get(
+                        "previous_snapshot_hash"
+                    ),
+                )
+                raw_observation = (
+                    await light_result
+                    if inspect.isawaitable(light_result)
+                    else light_result
+                )
+                if raw_observation is not None and self._observation_is_empty(
+                    raw_observation
+                ):
+                    raw_observation = None
+        if raw_observation is None:
+            raw_observation = await self._call_tool(
+                browser_session_id=browser_session_id,
+                name="agent_browser_snapshot",
+                arguments={"interactive": True, "compact": True},
+                trace_context=trace_context,
+            )
+        observation_id = (trace_context or {}).get(
+            "action_id",
+            f"observation-{self._observation_revision + 1}",
         )
+        return self._normalize_observation(raw_observation, observation_id)
 
     def add_user_message(self, content: str) -> None:
         """追加用户消息，并同步写入不参与模型上下文的完整记录。"""
@@ -137,23 +181,30 @@ class Agent:
         self._conversation_compaction_attempted = False
         self._record({"type": "message", **message})
 
-    async def run(self, browser_session_id: str) -> AgentResult:
+    async def run(
+        self,
+        browser_session_id: str,
+        *,
+        run_id: str | None = None,
+    ) -> AgentResult:
         """循环执行“观察、决策、动作”，直到完成或达到最大步数。"""
         self.visual.reset()
         self._last_action_signature = None
         self._repeated_action_count = 0
+        self._task_mode = "read_only"
+        self._last_action_outcome = None
         self._run_count += 1
-        run_id = f"run-{self._run_count}"
+        active_run_id = run_id or f"run-{self._run_count}"
         try:
-            return await self._run_loop(browser_session_id, run_id)
+            return await self._run_loop(browser_session_id, active_run_id)
         finally:
             if self.visual.started:
                 await self.visual.remove(
                     browser_session_id,
                     {
-                        "run_id": run_id,
-                        "step_id": f"{run_id}:cleanup",
-                        "action_id": f"{run_id}:cleanup:visual-overlay",
+                        "run_id": active_run_id,
+                        "step_id": f"{active_run_id}:cleanup",
+                        "action_id": f"{active_run_id}:cleanup:visual-overlay",
                     },
                 )
 
@@ -169,6 +220,8 @@ class Agent:
         observation_required = True
         pending_outcome: dict[str, Any] | None = None
         pending_fingerprint: tuple[str | None, str] | None = None
+        failure_retry_observation_id: str | None = None
+        failure_retry_count = 0
         token_usage = await self._maybe_compact_conversation(
             browser_session_id,
             run_id,
@@ -185,6 +238,14 @@ class Agent:
                             "run_id": run_id,
                             "step_id": step_id,
                             "action_id": observation_id,
+                            "prefer_light": (
+                                "true" if pending_outcome is not None else "false"
+                            ),
+                            "previous_snapshot_hash": (
+                                pending_fingerprint[1]
+                                if pending_fingerprint is not None
+                                else ""
+                            ),
                         },
                     )
                     stabilization_retried = False
@@ -201,6 +262,7 @@ class Agent:
                                 "run_id": run_id,
                                 "step_id": step_id,
                                 "action_id": observation_id,
+                                "prefer_light": "false",
                             },
                         )
                     self._record_page_visit(observation)
@@ -211,6 +273,7 @@ class Agent:
                             before=pending_fingerprint,
                             after=new_fingerprint,
                         )
+                        self._update_mutation_state(pending_outcome)
                         pending_outcome["effect"][
                             "observation_id"
                         ] = observation_id
@@ -224,11 +287,14 @@ class Agent:
                                 ),
                             }
                         )
+                        self._last_action_outcome = pending_outcome
                         self._record(pending_outcome.copy())
                     observation_fingerprint = new_fingerprint
                     observation_required = False
                     pending_outcome = None
                     pending_fingerprint = None
+                    failure_retry_observation_id = observation_id
+                    failure_retry_count = 0
 
                 visible_tools = select_mcp_tools_for_llm(self.browser.tools)
                 allowed_names = REGISTERED_TOOL_NAMES | TOOL_GETTER_NAMES
@@ -237,6 +303,14 @@ class Agent:
                 input_metrics = self.llm.input_metrics(
                     observation,
                     llm_task_context,
+                )
+                token_slots = self.llm.token_slot_metrics(
+                    observation=observation,
+                    messages=llm_messages,
+                    task_context=llm_task_context,
+                    system_prompt=self.llm._build_system_prompt(
+                        format_mcp_tools(visible_tools)
+                    ),
                 )
                 self._record(
                     {
@@ -249,6 +323,7 @@ class Agent:
                         "messages": llm_messages,
                         "task_context": llm_task_context,
                         "input_metrics": input_metrics,
+                        "token_slots": token_slots,
                         "endpoint_id": self.llm.endpoint_id,
                         "model": self.llm.model,
                         "timeout_seconds": self.llm.request_timeout_seconds,
@@ -314,6 +389,34 @@ class Agent:
                 if provider_details is not None:
                     error_event["provider_details"] = provider_details
                 self._record(error_event)
+                if (
+                    str(error_type).startswith("provider_output_")
+                    and observation_id is not None
+                    and failure_retry_observation_id == observation_id
+                    and failure_retry_count < 1
+                ):
+                    failure_retry_count += 1
+                    failure = self._make_step_failure(
+                        stage="provider",
+                        code=str(error_type),
+                        message=str(exc) or str(error_type),
+                        retryable=True,
+                        observation_id=observation_id,
+                        attempt=failure_retry_count,
+                    )
+                    self._record(
+                        {
+                            "type": "step_failure",
+                            **failure,
+                        }
+                    )
+                    self._append_task_context(
+                        {
+                            "type": "step_failure",
+                            **failure,
+                        }
+                    )
+                    continue
                 if str(error_type).startswith("provider_output_"):
                     answer = (
                         "模型返回格式异常，未能生成可靠的最终结果，请重试。"
@@ -326,10 +429,51 @@ class Agent:
                     token_usage=token_usage,
                 )
 
+            completion_failure = self._completion_failure(
+                decision,
+                observation_id=observation_id,
+                observation_required=observation_required,
+                pending_outcome=pending_outcome,
+            )
+            if completion_failure is not None:
+                self._record(
+                    {
+                        "type": "completion_blocked",
+                        **completion_failure,
+                    }
+                )
+                self._append_task_context(
+                    {
+                        "type": "step_failure",
+                        **completion_failure,
+                    }
+                )
+                if (
+                    observation_id is not None
+                    and failure_retry_observation_id == observation_id
+                    and failure_retry_count < 1
+                ):
+                    failure_retry_count += 1
+                    self._record(
+                        {
+                            "type": "step_failure",
+                            **completion_failure,
+                        }
+                    )
+                    continue
+                return self._finish(
+                    success=False,
+                    answer=(
+                        "动作结果尚未得到可靠确认，任务未完成；请先重新观察页面。"
+                    ),
+                    token_usage=token_usage,
+                    status="blocked",
+                )
+
             if decision.status in {"completed", "blocked"}:
                 return self._finish(
                     success=decision.status == "completed",
-                    answer=decision.final_answer,
+                    answer=decision.final_answer or "",
                     token_usage=token_usage,
                     status=decision.status,
                 )
@@ -355,6 +499,30 @@ class Agent:
                     "action_id": f"{step_id}:action-{action_number}",
                     "browser_session_id": browser_session_id,
                 }
+                action, stale_ref = self._bind_action_to_observation(
+                    action,
+                    observation_id,
+                    self._observation_revision,
+                )
+                if stale_ref:
+                    stale_result = self._tool_outcome(
+                        name=action.name,
+                        arguments=action.arguments,
+                        error={
+                            "code": "stale_element_ref",
+                            "message": (
+                                "The element ref belongs to an older page "
+                                "observation."
+                            ),
+                            "expected_observation_id": observation_id,
+                            "expected_revision": self._observation_revision,
+                        },
+                        trace_context=action_context,
+                    )
+                    self._append_task_context(stale_result)
+                    self._record(stale_result.copy())
+                    observation_required = True
+                    break
                 if action.name not in allowed_names:
                     rejected_result = self._tool_outcome(
                         name=action.name,
@@ -366,19 +534,32 @@ class Agent:
                     self._record(rejected_result.copy())
                     break
 
-                if self._register_action(
+                repeated_action_count = self._register_action(
                     action,
                     observation_fingerprint,
-                ) >= self.REPEATED_ACTION_LIMIT:
+                )
+                if repeated_action_count == 2:
+                    nudge = {
+                        "type": "strategy_nudge",
+                        "code": "repeated_action",
+                        "message": (
+                            "The same action made no progress twice; "
+                            "change the target or use a different strategy."
+                        ),
+                    }
+                    self._append_task_context(nudge)
+                    self._record(nudge.copy())
+                if repeated_action_count >= repetition_limit(action.name):
                     message = (
-                        "RepeatedAction: identical action made no page "
-                        "progress twice"
+                        "RepeatedAction: identical action reached the "
+                        "no-progress hard limit"
                     )
                     repeated_result = self._tool_outcome(
                         name=action.name,
                         arguments=action.arguments,
                         error={
                             "type": "RepeatedAction",
+                            "code": "repeated_action",
                             "message": message,
                         },
                         trace_context=action_context,
@@ -391,7 +572,7 @@ class Agent:
                         success=False,
                         answer=(
                             "Agent stopped because the same action made "
-                            "no page progress twice"
+                            "no page progress and reached the hard limit"
                         ),
                         token_usage=token_usage,
                     )
@@ -428,9 +609,46 @@ class Agent:
                     # 工具组结果要先回到模型，且不需要重新抓取页面。
                     break
 
-                requires_observation = (
-                    action.name in OBSERVATION_REQUIRED_ACTIONS
+                tool = next(
+                    (
+                        candidate
+                        for candidate in self.browser.tools
+                        if getattr(candidate, "name", None) == action.name
+                    ),
+                    None,
                 )
+                behavior = get_tool_behavior(action.name, tool)
+                requires_observation = behavior.terminates_sequence or (
+                    behavior.potential_write
+                    and action_number == len(decision.actions)
+                )
+                if behavior.category == "potential_write":
+                    self._task_mode = "write"
+                elif (
+                    behavior.category == "navigation"
+                    and self._task_mode == "read_only"
+                ):
+                    self._task_mode = "navigation"
+                mutation: MutationIntent | None = None
+                if behavior.potential_write:
+                    mutation = MutationIntent(
+                        action_id=action_context["action_id"],
+                        tool_name=action.name,
+                        arguments=action.arguments,
+                        status="prepared",
+                        page_url=observation_fingerprint[0]
+                        if observation_fingerprint is not None
+                        else None,
+                    )
+                    mutation.prepared_at = time.time()
+                    self._pending_mutations[mutation.mutation_id] = mutation
+                    self._record(
+                        {
+                            "type": "mutation_intent",
+                            **mutation.model_dump(),
+                        }
+                    )
+                    self._set_mutation_status(mutation, "dispatched")
                 await self.visual.prepare(
                     browser_session_id,
                     action,
@@ -451,18 +669,47 @@ class Agent:
                         trace_context=action_context,
                     )
                 except Exception as exc:
+                    uncertain_exception = (
+                        getattr(exc, "uncertain", False)
+                        or isinstance(exc, TimeoutError)
+                        or (
+                            mutation is not None
+                            and isinstance(exc, (ConnectionError, EOFError))
+                        )
+                    )
+                    if mutation is not None:
+                        self._set_mutation_status(
+                            mutation,
+                            "uncertain" if uncertain_exception else "failed",
+                            error=exception_details(exc),
+                        )
                     outcome = self._tool_outcome(
                         name=action.name,
                         arguments=action.arguments,
                         error=exception_details(exc),
                         uncertain=(
-                            requires_observation
-                            and isinstance(exc, TimeoutError)
+                            mutation is not None and uncertain_exception
                         ),
+                        dispatched=self._exception_was_dispatched(exc),
                         trace_context=action_context,
                     )
                     stored_outcome = self._append_task_context(outcome)
-                    if requires_observation and isinstance(exc, TimeoutError):
+                    self._last_action_outcome = stored_outcome
+                    should_observe_after_failure = (
+                        (
+                            requires_observation
+                            and (
+                                uncertain_exception
+                                or getattr(exc, "code", None)
+                                == "session_disconnected"
+                            )
+                        )
+                        or (
+                            mutation is not None
+                            and uncertain_exception
+                        )
+                    )
+                    if should_observe_after_failure:
                         pending_outcome = stored_outcome
                         pending_fingerprint = observation_fingerprint
                         observation_required = True
@@ -470,13 +717,47 @@ class Agent:
                         self._record(stored_outcome.copy())
                     break
 
+                if mutation is not None and not requires_observation:
+                    effect = ActionEffect(
+                        dispatched=outcome["effect"]["dispatched"],
+                        confirmed=outcome["status"] == "succeeded",
+                    )
+                    mutation_status: MutationStatus = (
+                        "confirmed"
+                        if outcome["status"] == "succeeded"
+                        else "uncertain"
+                        if outcome["status"] == "uncertain"
+                        else "failed"
+                    )
+                    self._set_mutation_status(
+                        mutation,
+                        mutation_status,
+                        effect=effect,
+                    )
+                    outcome["effect"] = effect.model_dump()
+
                 stored_outcome = self._append_task_context(outcome)
+                self._last_action_outcome = stored_outcome
 
                 # 可能改变页面的动作在下一轮只观察一次，并据此补充实际效果。
+                if outcome["status"] == "failed":
+                    if mutation is not None:
+                        self._set_mutation_status(
+                            mutation,
+                            "failed",
+                            error=outcome.get("error"),
+                            effect=ActionEffect.model_validate(
+                                outcome.get("effect") or {}
+                            ),
+                        )
+                    self._record(stored_outcome.copy())
+                    break
                 if requires_observation:
                     pending_outcome = stored_outcome
                     pending_fingerprint = observation_fingerprint
                     observation_required = True
+                    break
+                if stored_outcome["status"] != "succeeded":
                     break
                 self._record(stored_outcome.copy())
 
@@ -504,6 +785,36 @@ class Agent:
         }
         return action.model_copy(update={"arguments": arguments})
 
+    @classmethod
+    def _bind_action_to_observation(
+        cls,
+        action: AgentAction,
+        observation_id: str | None,
+        observation_revision: int,
+    ) -> tuple[AgentAction, bool]:
+        selector = action.arguments.get("selector")
+        if not isinstance(selector, str) or not BARE_REF_SELECTOR_PATTERN.fullmatch(
+            selector
+        ):
+            return action, False
+        if (
+            action.observation_id is not None
+            and action.observation_id != observation_id
+        ) or (
+            action.observation_revision is not None
+            and action.observation_revision != observation_revision
+        ):
+            return action, True
+        return (
+            action.model_copy(
+                update={
+                    "observation_id": observation_id,
+                    "observation_revision": observation_revision,
+                }
+            ),
+            False,
+        )
+
     def _register_action(
         self,
         action: AgentAction,
@@ -523,6 +834,226 @@ class Agent:
         return self._repeated_action_count
 
     @staticmethod
+    def _make_step_failure(
+        *,
+        stage: Literal[
+            "provider",
+            "browser",
+            "tool",
+            "validation",
+            "completion",
+            "runtime",
+            "loop",
+            "cancelled",
+        ],
+        code: str,
+        message: str,
+        retryable: bool,
+        uncertain: bool = False,
+        observation_id: str | None = None,
+        attempt: int = 1,
+    ) -> dict[str, Any]:
+        """将跨边界异常收敛为下一轮可以消费的结构。"""
+        return StepFailure(
+            stage=stage,
+            code=code,
+            retryable=retryable,
+            uncertain=uncertain,
+            message=message,
+            observation_id=observation_id,
+            attempt=attempt,
+        ).model_dump()
+
+    def _normalize_observation(
+        self,
+        raw_observation: Any,
+        observation_id: str,
+    ) -> dict[str, Any]:
+        """在 MCP 边界后给页面观察补充稳定版本和摘要元数据。"""
+        self._observation_revision += 1
+        payload = (
+            dict(raw_observation)
+            if isinstance(raw_observation, dict)
+            else {"value": raw_observation}
+        )
+        nested = payload.get("data")
+        source = nested if isinstance(nested, dict) else payload
+        snapshot = extract_snapshot(payload)
+        snapshot_hash = None
+        source_characters = 0
+        if snapshot is not None:
+            snapshot_hash = hashlib.sha256(snapshot.encode("utf-8")).hexdigest()
+            source_characters = len(snapshot)
+        url = source.get("url") or source.get("origin")
+        title = source.get("title")
+        observation_model = BrowserObservation(
+            observation_id=observation_id,
+            revision=self._observation_revision,
+            url=url if isinstance(url, str) else None,
+            title=title if isinstance(title, str) else None,
+            snapshot=snapshot,
+            snapshot_hash=snapshot_hash,
+            source_characters=source_characters,
+            sent_characters=source_characters,
+            stability=(
+                "empty"
+                if snapshot is None or not snapshot.strip()
+                else "stable"
+            ),
+            data=payload,
+        )
+        self._latest_observation = observation_model
+        normalized = {
+            **payload,
+            **observation_model.model_dump(exclude={"data"}),
+        }
+        return normalized
+
+    def _completion_failure(
+        self,
+        decision: AgentDecision,
+        *,
+        observation_id: str | None,
+        observation_required: bool,
+        pending_outcome: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if decision.status not in {"completed", "blocked"}:
+            return None
+        pending_mutations = [
+            intent
+            for intent in self._pending_mutations.values()
+            if intent.status in {"prepared", "dispatched", "uncertain"}
+        ]
+        if pending_mutations:
+            return self._make_step_failure(
+                stage="completion",
+                code="pending_mutation",
+                message=(
+                    "A potential write action is still pending confirmation; "
+                    "observe its result before completing."
+                ),
+                retryable=True,
+                uncertain=True,
+                observation_id=observation_id,
+            )
+        if self._last_action_outcome is not None:
+            last_status = self._last_action_outcome.get("status")
+            last_effect = self._last_action_outcome.get("effect") or {}
+            if last_status == "failed" and last_effect.get("dispatched") is not False:
+                return self._make_step_failure(
+                    stage="completion",
+                    code="action_failed",
+                    message=(
+                        "The most recent browser action failed; its result "
+                        "must be handled before completing."
+                    ),
+                    retryable=True,
+                    observation_id=observation_id,
+                )
+            if last_status == "uncertain":
+                return self._make_step_failure(
+                    stage="completion",
+                    code="action_uncertain",
+                    message=(
+                        "The most recent browser action has no reliable "
+                        "confirmation."
+                    ),
+                    retryable=True,
+                    uncertain=True,
+                    observation_id=observation_id,
+                )
+        if self._task_mode in {"read_only", "navigation"} and not observation_id:
+            return self._make_step_failure(
+                stage="completion",
+                code=(
+                    "read_only_completion_evidence_required"
+                    if self._task_mode == "read_only"
+                    else "navigation_completion_evidence_required"
+                ),
+                message="Completion evidence must reference a current observation.",
+                retryable=True,
+                observation_id=observation_id,
+            )
+        if observation_required or pending_outcome is not None:
+            return self._make_step_failure(
+                stage="completion",
+                code="action_observation_required",
+                message=(
+                    "The last page-changing action has not been observed yet."
+                ),
+                retryable=True,
+                observation_id=observation_id,
+            )
+        return None
+
+    def _update_mutation_state(self, outcome: dict[str, Any]) -> None:
+        action_id = outcome.get("action_id")
+        if not isinstance(action_id, str):
+            return
+        intent = next(
+            (
+                item
+                for item in self._pending_mutations.values()
+                if item.action_id == action_id
+            ),
+            None,
+        )
+        if intent is None:
+            return
+        effect = ActionEffect.model_validate(outcome.get("effect") or {})
+        if outcome.get("status") == "failed":
+            self._set_mutation_status(
+                intent,
+                "failed",
+                error=outcome.get("error"),
+                effect=effect,
+            )
+            return
+        if effect.page_changed is True:
+            effect.confirmed = True
+            self._set_mutation_status(
+                intent,
+                "confirmed",
+                error=outcome.get("error"),
+                effect=effect,
+            )
+            outcome["effect"] = effect.model_dump()
+            return
+        self._set_mutation_status(
+            intent,
+            "uncertain",
+            error=outcome.get("error"),
+            effect=effect,
+        )
+
+    def _set_mutation_status(
+        self,
+        intent: MutationIntent,
+        status: MutationStatus,
+        *,
+        error: Any = None,
+        effect: ActionEffect | None = None,
+    ) -> None:
+        """记录一次潜在写操作的状态迁移，避免恢复路径丢失证据。"""
+        previous_status = intent.status
+        intent.status = status  # type: ignore[assignment]
+        if status == "dispatched" and intent.dispatched_at is None:
+            intent.dispatched_at = time.time()
+        if error is not None:
+            intent.error = error
+        if effect is not None:
+            intent.effect = effect
+        if previous_status == status:
+            return
+        self._record(
+            {
+                "type": "mutation_intent",
+                "event": "status_changed",
+                **intent.model_dump(),
+            }
+        )
+
+    @staticmethod
     def _observation_is_empty(observation: Any) -> bool:
         snapshot = extract_snapshot(observation)
         if snapshot is None:
@@ -534,6 +1065,24 @@ class Agent:
             "(empty snapshot)",
         }
 
+    @staticmethod
+    def _exception_was_dispatched(exc: Exception) -> bool:
+        """区分调用前校验/定位错误和已经发到浏览器的失败。"""
+        if getattr(exc, "code", None) in {
+            "invalid_tool_arguments",
+            "stale_element_ref",
+        }:
+            return False
+        message = str(exc).casefold()
+        return not any(
+            marker in message
+            for marker in (
+                "element not found",
+                "no such element",
+                "unknown selector",
+            )
+        )
+
     def _append_task_context(
         self,
         item: dict[str, Any],
@@ -541,6 +1090,12 @@ class Agent:
         """保存当前任务的最新进度或完整工具结果，任务结束后再精简。"""
         safe_item = redact_value(item)
         if safe_item.get("type") == "tool_result":
+            tool_name = safe_item.get("name")
+            if isinstance(tool_name, str):
+                safe_item["arguments"] = redact_tool_arguments(
+                    tool_name,
+                    item.get("arguments") or {},
+                )
             fresh_items = [
                 existing
                 for existing in self.task_context
@@ -716,9 +1271,9 @@ class Agent:
                 page["title"] = str(redact_value(title))
             return page or None
         for key in ("data", "response"):
-            page = cls._extract_page_visit(value.get(key))
-            if page is not None:
-                return page
+            nested_page = cls._extract_page_visit(value.get(key))
+            if nested_page is not None:
+                return nested_page
         return None
 
     @classmethod
@@ -811,6 +1366,7 @@ class Agent:
         result: Any = None,
         error: Any = None,
         uncertain: bool = False,
+        dispatched: bool | None = None,
         trace_context: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """把不同 MCP 返回统一成模型可稳定判断的工具结果。"""
@@ -823,7 +1379,9 @@ class Agent:
                 "data": None,
                 "error": error,
                 "effect": {
-                    "dispatched": uncertain,
+                    "dispatched": (
+                        uncertain if dispatched is None else dispatched
+                    ),
                     "page_changed": None,
                 },
             }
@@ -855,13 +1413,23 @@ class Agent:
                 "data": data,
                 "error": result_error,
                 "effect": {
-                    "dispatched": status == "succeeded",
+                    "dispatched": True,
                     "page_changed": None,
                 },
             }
         if trace_context:
+            outcome["action_id"] = trace_context.get("action_id")
+        typed_outcome = ToolOutcome.model_validate(outcome).model_dump()
+        if trace_context:
             outcome.update(trace_context)
-        return outcome
+        typed_outcome.update(
+            {
+                key: value
+                for key, value in outcome.items()
+                if key not in typed_outcome
+            }
+        )
+        return typed_outcome
 
     @classmethod
     def _page_fingerprint(
@@ -881,6 +1449,20 @@ class Agent:
                 url = candidate_url
         snapshot = extract_snapshot(payload)
         if snapshot is None:
+            if isinstance(payload, dict):
+                payload = {
+                    key: value
+                    for key, value in payload.items()
+                    if key
+                    not in {
+                        "observation_id",
+                        "revision",
+                        "snapshot_hash",
+                        "source_characters",
+                        "sent_characters",
+                        "stability",
+                    }
+                }
             snapshot = json.dumps(
                 payload,
                 ensure_ascii=False,

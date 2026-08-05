@@ -17,9 +17,11 @@ from app.utils.errors import is_transient_error
 class _ProviderAgentAction(AgentAction):
     """严格输出边界使用字符串承载可变工具参数。"""
 
-    # 部分兼容厂商会把函数名修复为 type，边界层统一收敛为内部 name。
-    name: str = Field(validation_alias=AliasChoices("name", "type"))
-    arguments: str
+    # 部分兼容厂商把函数名写成 type 或 tool，边界层统一收敛为内部 name。
+    name: str = Field(
+        validation_alias=AliasChoices("name", "type", "tool")
+    )
+    arguments: str = Field(default="")
 
     @field_validator("arguments", mode="before")
     @classmethod
@@ -230,7 +232,7 @@ class OpenAIResponsesAdapter:
 
     def _decision_from_text(self, output: str) -> AgentDecision:
         transport = self.DECISION_FORMAT.model_validate_json(
-            _normalize_json_text(output)
+            _unwrap_decision_payload(_normalize_json_text(output))
         )
         return self._to_agent_decision(transport)
 
@@ -251,10 +253,20 @@ class OpenAIResponsesAdapter:
                 "role": "system",
                 "content": (
                     "只修复浏览器 Agent 决策的 JSON 格式，不改变事实、状态、"
-                    "动作和最终答案。只返回一个合法 JSON 对象，不要使用 Markdown。"
-                    "completed/blocked 必须包含 completion_evidence 和 final_answer；"
-                    "continue 必须包含 next_goal 和 actions。actions.arguments 必须是"
-                    " JSON 对象字符串。"
+                    "动作和最终答案。必须只返回一个合法 JSON 对象，不要使用 "
+                    "Markdown，不要把内容包在 decision、data、result 等字段里。"
+                    "顶层必须包含 status(continue|completed|blocked)、"
+                    "evaluation_previous_goal、memory。"
+                    "continue 还需 next_goal 和 1-3 个 actions；actions 使用 "
+                    "name 字段，arguments 必须是 JSON 对象字符串。"
+                    "completed/blocked 还需 completion_evidence 和 "
+                    "final_answer，且不能有 actions。"
+                    "evaluation_previous_goal 或 memory 缺失时，根据原输出"
+                    "补写简洁的进度文本。示例：{\"status\":\"continue\","
+                    "\"evaluation_previous_goal\":\"...\",\"memory\":\"...\","
+                    "\"next_goal\":\"...\",\"actions\":[{\"name\":"
+                    "\"agent_browser_open\",\"arguments\":"
+                    "\"{\\\"url\\\":\\\"https://x.com\\\"}\"}]}"
                 ),
             },
             {"role": "user", "content": payload},
@@ -281,7 +293,14 @@ class OpenAIResponsesAdapter:
                 raise ValueError(
                     f"Action {action.name!r} arguments must decode to an object"
                 )
-            actions.append(AgentAction(name=action.name, arguments=arguments))
+            actions.append(
+                AgentAction(
+                    name=action.name,
+                    arguments=arguments,
+                    observation_id=action.observation_id,
+                    observation_revision=action.observation_revision,
+                )
+            )
 
         payload = transport.model_dump(exclude={"actions"})
         payload["actions"] = actions
@@ -297,6 +316,26 @@ def _normalize_json_text(output: str) -> str:
             candidate = candidate.rstrip()[:-3].rstrip()
     start, end = candidate.find("{"), candidate.rfind("}")
     return candidate[start : end + 1] if start >= 0 and end >= start else candidate
+
+
+DECISION_WRAPPER_KEYS = frozenset(
+    {"decision", "data", "result", "output", "response"}
+)
+
+
+def _unwrap_decision_payload(output: str) -> str:
+    """兼容模型把整个决策包在单键包装里的输出，如 {\"decision\": {...}}。"""
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        return output
+    if not isinstance(payload, dict) or len(payload) != 1:
+        return output
+    for key in DECISION_WRAPPER_KEYS:
+        wrapped = payload.get(key)
+        if isinstance(wrapped, dict):
+            return json.dumps(wrapped, ensure_ascii=False)
+    return output
 
 
 def _raw_output_from_error(exc: Exception) -> str | None:
